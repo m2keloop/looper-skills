@@ -1,0 +1,12 @@
+# Python 缓存与 macOS 元数据
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# 运行期隐私归档与生成结果
+**/Prompt.txt
+**/collection.json
+**/run-manifest.json
+**/outputs.json
+**/crop-manifest.json
+**/下半部黑白手绘单图/

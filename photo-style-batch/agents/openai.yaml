@@ -1,0 +1,7 @@
+interface:
+  display_name: "照片批量风格转换"
+  short_description: "批量转换文件夹照片，保留原图、独立归档并支持隐私模式"
+  default_prompt: "使用 $photo-style-batch，把源文件夹中的所有图片按这段提示词转换，并保存到一个新的编号文件夹；涉及敏感照片时启用隐私模式。"
+
+policy:
+  allow_implicit_invocation: true
