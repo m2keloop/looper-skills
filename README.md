@@ -6,8 +6,19 @@
 
 | Skill | 简介 |
 | --- | --- |
+| [a-share-policy-screen](./a-share-policy-screen/SKILL.md) | lan选股策略：执行七种 A 股收盘选股规则，并生成策略切换、紧凑股票列表和联动量价图报告。 |
 | [ncm-convert](./ncm-convert/SKILL.md) | 使用 ncmdump 将网易云音乐 `.ncm` 文件转换为 MP3 或 FLAC，支持单文件和文件夹批量转换。 |
 | [photo-style-batch](./photo-style-batch/SKILL.md) | 根据提示词批量转换照片，支持递增归档、双画面裁切、匿名输出和元数据清除。 |
+
+### a-share-policy-screen
+
+执行地量、B1、B1 周线、B1_V2、B2_V1、年线金叉回踩和对数乖离率七种 A 股收盘选股策略。默认在同一目标日和候选范围内复用前复权 K 线输入，减少重复行情请求；结果以策略切换、紧凑股票列表和量价图展示。
+
+使用示例：
+
+> 用 $a-share-policy-screen 跑最近收盘日的全部策略，展示选股结果。
+
+行情适配自 [simonlin1212/a-stock-data](https://github.com/simonlin1212/a-stock-data)，所含适配代码的许可证见 [a-stock-data-LICENSE.txt](./a-share-policy-screen/references/a-stock-data-LICENSE.txt)。
 
 ### ncm-convert
 

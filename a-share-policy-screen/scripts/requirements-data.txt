@@ -1,0 +1,4 @@
+requests>=2.31,<3
+pandas>=2.1,<3
+baostock>=0.8,<1
+mootdx>=0.11,<1

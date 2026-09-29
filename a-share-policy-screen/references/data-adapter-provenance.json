@@ -1,0 +1,23 @@
+{
+  "url": "https://github.com/simonlin1212/a-stock-data/blob/main/SKILL.md",
+  "version": "3.10.0",
+  "downloaded_at": "2026-09-29",
+  "sha256": "4d23acf79e86be4241024759ba966d6a43fc5944b53019890ebd229807535cea",
+  "extracted_blocks": [
+    "get_prefix",
+    "norm_ticker",
+    "em_get",
+    "_v39_http",
+    "tencent_quote",
+    "tencent_kline",
+    "eastmoney_stock_info",
+    "eastmoney_concept_blocks",
+    "bs_session",
+    "baostock_stock_basic",
+    "trading_calendar"
+  ],
+  "local_modifications": [
+    "Only read-only market, finance, board, and calendar helpers retained; unrelated APIs and examples removed.",
+    "Collector combines qfq historical/recent data with overlap checks, verifies volume units, bounds fallback subprocesses, and records source failures."
+  ]
+}
