@@ -1,0 +1,8 @@
+exports/
+runs/
+__pycache__/
+*.py[cod]
+*.log
+**/raw/
+**/*checkpoint*.json
+**/*request-log*.json

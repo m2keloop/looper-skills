@@ -1,0 +1,55 @@
+{
+  "scope": "buhui公开比赛目录及本地registry中的比赛；不是同花顺平台全部比赛目录。",
+  "directory_url": "https://buhui.ai/api/v1/competitions",
+  "updated_at": "2026-10-10T16:30:57+08:00",
+  "items": [
+    {
+      "key": "DfMwdDc",
+      "title": "问鼎杯炒股大赛"
+    },
+    {
+      "key": "wJNwnjj",
+      "title": "知行合一好人赛"
+    },
+    {
+      "key": "PPp6jMw",
+      "title": "《梦想在上杯》2026年赛"
+    },
+    {
+      "key": "2oJW77m",
+      "title": "GS炒股大赛第二届―——游资联盟举办"
+    },
+    {
+      "key": "2Jf6P7k",
+      "title": "《伯乐杯》人才选拔赛"
+    },
+    {
+      "key": "FfdNcdo",
+      "title": "风云杯争霸赛"
+    },
+    {
+      "key": "FfdtQfj",
+      "title": "龙虎杯炒股大赛2026"
+    },
+    {
+      "key": "2JPMM73",
+      "title": "第四届《复盘杯》实盘大赛"
+    },
+    {
+      "key": "6kn32Nc",
+      "title": "第三届（2026年度）“踏浪杯”炒股大赛年赛"
+    },
+    {
+      "key": "t2qdNCk",
+      "title": "小米粥杯2026年赛"
+    },
+    {
+      "key": "OpNkkDf",
+      "title": "【主升杯】2026年赛"
+    },
+    {
+      "key": "tjjJYCk",
+      "title": "板块必读&桃粉杯第二届"
+    }
+  ]
+}
