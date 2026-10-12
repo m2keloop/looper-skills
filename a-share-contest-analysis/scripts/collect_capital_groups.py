@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect all capital-tier public holdings for one hot-contest snapshot."""
+"""Collect million/thousand capital-tier holdings for one hot-contest snapshot."""
 import argparse
 import fcntl
 import hashlib
@@ -9,15 +9,31 @@ import re
 import shutil
 import sys
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from analyze_hot_contests import read_snapshot
+from analyze_hot_contests import load_capital_groups, read_snapshot, validate_weights
 from collect_hot_contests import AccessLimited, PublicClient, SourceError, now, official_url, save, source_data
 
 ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_PATH = ROOT / 'data' / 'consensus-weights.json'
-GROUPS = {'1': '新手组', '10': '十万组', '100': '百万组', '1000': '千万组'}
-SCOPE = '新手组、十万组、百万组、千万组公开可读取持仓，仅匹配各赛本次官方热榜股票'
+GROUPS = {'100': '百万组', '1000': '千万组'}
+SCOPE = '百万组、千万组公开可读取持仓，仅匹配各赛本次官方热榜股票'
+IDENTITY_FIELDS = ('schema_version', 'base_run_id', 'base_completed_at',
+                   'base_fingerprint', 'collection_date')
+
+
+def collection_timestamp(value):
+    if not isinstance(value, str):
+        raise SourceError('Capital-group collection has no valid timestamp')
+    try:
+        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError as error:
+        raise SourceError('Capital-group collection has no valid timestamp') from error
+    if result.tzinfo is None:
+        raise SourceError('Capital-group collection timestamp has no timezone')
+    return result.astimezone(ZoneInfo('Asia/Shanghai'))
 
 
 def weights_config():
@@ -58,9 +74,28 @@ def snapshot_identity(snapshot):
             'base_fingerprint': digest.hexdigest(), 'collection_date': now()[:10]}
 
 
+def validate_collection_identity(snapshot, metadata, require_completed=False):
+    """Reject stale or cross-day work before reusing or publishing holdings."""
+    expected = snapshot_identity(snapshot)
+    base_time = collection_timestamp(expected['base_completed_at'])
+    if base_time.date().isoformat() != expected['collection_date']:
+        raise SourceError('Capital groups require a base hot-list snapshot from today')
+    if (not isinstance(metadata, dict) or type(metadata.get('schema_version')) is not int
+            or any(metadata.get(field) != expected[field] for field in IDENTITY_FIELDS)):
+        raise SourceError('Capital-group collection identity does not match today\'s exact base snapshot')
+    if require_completed:
+        completed = collection_timestamp(metadata.get('completed_at'))
+        if completed.date().isoformat() != expected['collection_date'] or completed < base_time:
+            raise SourceError('Capital-group collection completed on another day or before its base snapshot')
+    return expected
+
+
 def load_checkpoint(snapshot, code):
+    if code not in GROUPS:
+        raise SourceError('Only million/thousand capital groups are enabled')
     path = snapshot['path'] / f'group-{code}-checkpoint.json'
     identity = {**snapshot_identity(snapshot), 'group_code': code}
+    validate_collection_identity(snapshot, identity)
     if path.exists():
         saved = json.loads(path.read_text(encoding='utf-8'))
         if saved.get('metadata') == identity and isinstance(saved.get('contests'), dict):
@@ -69,10 +104,13 @@ def load_checkpoint(snapshot, code):
 
 
 def collect_roster(client, contest, entry, code, raw_dir, checkpoint_path, checkpoint):
+    if code not in GROUPS:
+        raise SourceError('Only million/thousand capital groups are enabled')
     seen = set(entry.get('members', []))
     page = int(entry.get('last_page', 0)) + 1
     entry.setdefault('members', [])
     entry.setdefault('holdings', {})
+    entry.update(ranking_complete=False, ranking_status='collecting')
     while True:
         if page > contest['participant_count'] + 1:
             raise SourceError('Group ranking exceeded participant-count safety bound')
@@ -92,6 +130,11 @@ def collect_roster(client, contest, entry, code, raw_dir, checkpoint_path, check
                           for row in rows if isinstance(row, dict)]})
         if not rows:
             entry.update(ranking_complete=True, ranking_status='complete', ranking_checked_at=now())
+            # A previous ranking failure is resolved only after all resumed
+            # pages pass validation and the official empty terminal page arrives.
+            if entry.get('failed_stage') == 'ranking':
+                entry.pop('failed_stage', None)
+                entry.pop('error', None)
             save(checkpoint_path, checkpoint)
             return
         start_count = len(entry['members'])
@@ -154,20 +197,40 @@ def validate_entry(entry, total_participants):
 def read_existing_thousand(snapshot):
     path = snapshot['path'] / 'thousand-group.json'
     if not path.exists():
-        raise SourceError('Complete thousand-group collection is required before weighting all capital tiers')
+        raise SourceError('Complete thousand-group collection is required before weighting million/thousand groups')
     payload = json.loads(path.read_text(encoding='utf-8'))
     meta = payload.get('metadata', {})
-    if meta.get('base_run_id') != snapshot['manifest']['run_id'] or meta.get('collection_complete') is not True:
+    validate_collection_identity(snapshot, meta, require_completed=True)
+    if meta.get('group_code') != '1000' or meta.get('collection_complete') is not True:
         raise SourceError('Thousand-group collection is incomplete or belongs to another snapshot')
-    return {'metadata': {'group_code': '1000', 'group_name': GROUPS['1000'],
-                         'base_run_id': snapshot['manifest']['run_id'],
-                         'collection_complete': True, 'member_count': meta['member_count'],
-                         'holdings_success_count': meta['holdings_success_count'],
-                         'holdings_failed_count': meta['holdings_failed_count'],
-                         'completed_at': meta['completed_at'], 'scope': meta['scope']},
+    # The source can carry a historic four-tier weight stamp. Reuse only its
+    # exact-snapshot observed counts; the merged supplement receives the current
+    # two-tier configuration. Keep the source JSON untouched.
+    collection_meta = {key: value for key, value in meta.items()
+                       if key not in ('weight_version', 'weights')}
+    return {'metadata': {**collection_meta, 'group_code': '1000', 'group_name': GROUPS['1000']},
             'contests': payload['contests'],
             'records': [{**row, 'group_holder_count': row['thousand_holder_count']}
                         for row in payload['records']]}
+
+
+def check_holdings_time_budget(snapshot, checkpoint, contests, code, interval):
+    """Use the completed official rosters, never estimates for missing members."""
+    validate_collection_identity(snapshot, checkpoint['metadata'])
+    pending = sum(entry['holdings'].get(uid, {}).get('status') != 'success'
+                  for contest in contests
+                  for entry in [checkpoint['contests'][contest['contest_key']]]
+                  for uid in entry['members'])
+    minimum_seconds = max(pending - 1, 0) * interval
+    current = collection_timestamp(now())
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    remaining_seconds = (midnight - current).total_seconds()
+    if minimum_seconds >= remaining_seconds:
+        raise SourceError(
+            f'{GROUPS[code]}本次完整官方名单尚有 {pending} 条公开持仓待读取；'
+            f'按 {interval:g} 秒串行间隔至少需要 {minimum_seconds:g} 秒'
+            f'（{minimum_seconds / 3600:.2f} 小时），当天剩余 {remaining_seconds:g} 秒'
+            f'（{remaining_seconds / 3600:.2f} 小时）；保留检查点，不生成加权报告')
 
 
 def collect_group(snapshot, code, client, interval):
@@ -185,7 +248,7 @@ def collect_group(snapshot, code, client, interval):
     try:
         for contest in contests:
             entry = checkpoint['contests'][contest['contest_key']]
-            if entry.get('ranking_complete') is True:
+            if entry.get('ranking_complete') is True and entry.get('failed_stage') != 'ranking':
                 continue
             raw = snapshot['path'] / 'competitions' / contest['contest_key'] / 'raw' / f'group-{code}'
             try:
@@ -198,6 +261,9 @@ def collect_group(snapshot, code, client, interval):
                 entry.update(ranking_status='failed', failed_stage='ranking', error=str(error))
                 save(checkpoint_path, checkpoint)
         if not stopped:
+            if all(checkpoint['contests'][c['contest_key']].get('ranking_complete') is True
+                   and not checkpoint['contests'][c['contest_key']].get('failed_stage') for c in contests):
+                check_holdings_time_budget(snapshot, checkpoint, contests, code, interval)
             for contest in contests:
                 key = contest['contest_key']
                 entry = checkpoint['contests'][key]
@@ -228,6 +294,9 @@ def collect_group(snapshot, code, client, interval):
 
 
 def build_group_payload(snapshot, checkpoint, code, interval, stopped):
+    completed_at = now()
+    identity = validate_collection_identity(snapshot, {**checkpoint['metadata'],
+                                                     'completed_at': completed_at}, require_completed=True)
     contests, records = [], []
     for contest in snapshot['contests']:
         key = contest['contest_key']
@@ -257,11 +326,8 @@ def build_group_payload(snapshot, checkpoint, code, interval, stopped):
     success_count = sum(c['holdings_success_count'] for c in contests)
     failed_count = sum(c['holdings_failed_count'] for c in contests)
     complete = all(c['collection_complete'] for c in contests)
-    return {'metadata': {'schema_version': 1, 'group_code': code, 'group_name': GROUPS[code],
-                         'base_run_id': snapshot['manifest']['run_id'],
-                         'base_completed_at': snapshot['manifest']['completed_at'],
-                         'collection_date': checkpoint['metadata']['collection_date'],
-                         'completed_at': now(), 'collection_complete': complete,
+    return {'metadata': {**identity, 'group_code': code, 'group_name': GROUPS[code],
+                         'completed_at': completed_at, 'collection_complete': complete,
                          'interval_seconds': interval, 'stopped_on_access_limit': stopped,
                          'contest_count': len(contests), 'record_count': len(records),
                          'member_count': member_count, 'holdings_success_count': success_count,
@@ -274,16 +340,18 @@ def run(args):
     weights = weights_config()
     groups = {'1000': read_existing_thousand(snapshot)}
     client = PublicClient(args.interval)
-    for code in ('1', '10', '100'):
+    for code in ('100',):
         groups[code] = collect_group(snapshot, code, client, args.interval)
         save(snapshot['path'] / f'group-{code}.json', groups[code])
         if groups[code]['metadata']['collection_complete'] is not True:
             raise SourceError(f'{GROUPS[code]} collection incomplete; weighted report will not publish')
     ordered = {code: groups[code] for code in GROUPS}
-    metadata = {'schema_version': 1, **weights, 'scope': SCOPE,
-                'base_run_id': snapshot['manifest']['run_id'],
-                'base_completed_at': snapshot['manifest']['completed_at'],
-                'collection_date': now()[:10], 'completed_at': now(),
+    for group in ordered.values():
+        identity = validate_collection_identity(snapshot, group['metadata'], require_completed=True)
+    completed_at = now()
+    validate_collection_identity(snapshot, {**identity, 'completed_at': completed_at}, require_completed=True)
+    metadata = {**identity, **weights, 'scope': SCOPE,
+                'completed_at': completed_at,
                 'collection_complete': all(g['metadata']['collection_complete'] for g in ordered.values()),
                 'interval_seconds': args.interval,
                 'member_count': sum(g['metadata']['member_count'] for g in ordered.values()),
@@ -300,6 +368,12 @@ def run(args):
     result = {'metadata': metadata, 'groups': ordered}
     output = snapshot['path'] / 'group-holdings.json'
     save(output, result)
+    analysis_weights = validate_weights({'version': weights['weight_version'],
+                                        'weights': weights['weights'], 'labels': weights['labels']})
+    validation = load_capital_groups(snapshot, analysis_weights, output)
+    if validation.get('available') is not True:
+        raise SourceError('Capital-group merged counts did not pass source validation; checkpoints retained: '
+                          + '; '.join(validation.get('warnings', [])))
     # Keep auditable fetch logs and aggregate group counts, then remove per-user
     # checkpoints/raw responses that contain public account identifiers or
     # portfolio details which the analysis does not need.

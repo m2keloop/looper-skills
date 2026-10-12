@@ -60,6 +60,12 @@ class ThousandGroupTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.config_path = self.root / 'weights.json'
+        self.config_path.write_text(json.dumps({'version': 'public-large-capital-groups-v2',
+                                               'weights': {'100': 3, '1000': 5}}), encoding='utf-8')
+        self.weights_patch = mock.patch.object(collector, 'WEIGHTS_PATH', self.config_path)
+        self.weights_patch.start()
+        self.addCleanup(self.weights_patch.stop)
         self.now_patch = mock.patch.object(collector, 'now', return_value='2026-10-08T19:00:00+08:00')
         self.now_patch.start()
         self.addCleanup(self.now_patch.stop)
@@ -111,6 +117,7 @@ class ThousandGroupTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertTrue(payload['metadata']['collection_complete'])
         self.assertEqual(payload['metadata']['weights']['1000'], 5)
+        self.assertEqual(set(payload['metadata']['weights']), {'100', '1000'})
         self.assertEqual(payload['metadata']['base_run_id'], path.name)
         self.assertEqual(payload['contests'][0]['member_count'], 3)
         self.assertEqual(payload['contests'][0]['public_empty_list_count'], 1)
@@ -190,14 +197,24 @@ class ThousandGroupTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertTrue(all(r['thousand_holder_count'] is None for r in payload['records']))
         config_path = self.root / 'weights.json'
-        for weights in ({'1': 1, '10': 1, '100': 2, '1000': 5},
-                        {'1': 1, '10': 1, '100': 1, '1000': 1},
-                        {'1': 1, '10': 1, '100': 1, '1000': float('inf')}):
+        for weights in ({'1': 1, '10': 2, '100': 3, '1000': 5},
+                        {'100': 1, '1000': 1},
+                        {'100': 1, '1000': float('inf')},
+                        {'100': 0, '1000': 5},
+                        {'100': -1, '1000': 5},
+                        {'100': 6, '1000': 5},
+                        {'100': True, '1000': 5},
+                        {'1000': 5}):
             with self.subTest(weights=weights):
                 config_path.write_text(json.dumps({'version': 'bad', 'weights': weights}))
                 with mock.patch.object(collector, 'WEIGHTS_PATH', config_path):
                     with self.assertRaises(collector.SourceError):
                         collector.weight_config()
+
+    def test_two_positive_distinct_weights_accept_thousand_as_highest(self):
+        config = collector.weight_config()
+        self.assertEqual(config, {'weight_version': 'public-large-capital-groups-v2',
+                                  'weights': {'100': 3, '1000': 5}})
 
     def test_failed_member_keeps_whole_contest_unknown_and_resume_reuses_only_successes(self):
         path = self.snapshot()

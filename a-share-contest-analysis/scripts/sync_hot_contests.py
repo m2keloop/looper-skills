@@ -85,6 +85,7 @@ def sync(args):
     stamp = datetime.now(TZ).strftime('%Y-%m-%d_%H%M%S_%f')
     status = {'started_at': now(), 'analyze_only': args.analyze_only,
               'collection_mode': 'official_hot_lists' if hot_only else 'capital_groups',
+              'active_group_codes': [] if hot_only else ['100', '1000'],
               'stage': 'starting', 'complete': False, 'exit_code': None}
     history = args.report_root / 'sync-history' / (stamp + '.json')
     try:
@@ -149,7 +150,7 @@ def sync(args):
         status.update(report_directory=str(report_dir), review_status=report['summary']['review_status'])
         if not args.analyze_only and not hot_only and report['summary'].get('group_weighting_available') is not True:
             status.update(exit_code=2,
-                          error='Four capital groups failed validation; published report retained.',
+                          error='Million and thousand capital groups failed validation; published report retained.',
                           group_validation_warnings=report['metadata']['group_collection'].get('warnings', []))
             return 2
         status['stage'] = 'render'
@@ -207,7 +208,7 @@ def main():
     parser.add_argument('--analyze-only', action='store_true', help='Analyze a saved complete snapshot without network requests')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--hot-only', dest='hot_only', action='store_true', help='Collect official hot lists only (default)')
-    mode.add_argument('--capital-groups', dest='hot_only', action='store_false', help='Explicitly collect all four member/holding tiers before weighting')
+    mode.add_argument('--capital-groups', dest='hot_only', action='store_false', help='Explicitly collect million and thousand member/holding tiers before weighting')
     parser.set_defaults(hot_only=True)
     parser.add_argument('--snapshot', type=Path, help='Explicit snapshot, only with --analyze-only')
     parser.add_argument('--snapshots', type=Path, default=ROOT / 'exports' / 'hot-contests')

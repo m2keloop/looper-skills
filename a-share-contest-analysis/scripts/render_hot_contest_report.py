@@ -87,8 +87,8 @@ PAGE = r'''<!doctype html>
       <div id="sample-change"></div>
       <label class="changecontrols"><input id="show-unchanged" type="checkbox">同时显示未变化记录</label>
       <h3>共同比赛的股票变化</h3>
-      <div class="tablewrap"><table><thead><tr><th>比赛</th><th>股票</th><th>变化类型</th><th class="num">基线人数</th><th class="num">本次人数</th><th class="num">人数变化</th><th class="num" data-group-delta>新手组变化</th><th class="num" data-group-delta>十万组变化</th><th class="num" data-group-delta>百万组变化</th><th class="num" data-group-delta>千万组变化</th><th class="num">基线名次</th><th class="num">本次名次</th><th class="num">名次变化</th></tr></thead><tbody id="change-body"></tbody></table><div class="empty" id="change-empty" hidden></div></div>
-      <p class="legend" id="changes-legend">入榜 / 出榜表示进入 / 离开官方热门榜，不能解释为买入 / 清仓。榜外人数未知，显示 —，不填成 0。四档公开持仓人数分别显示基线与本次变化，缺少可比基线时显示 —。绿色箭头表示名次上升，红色箭头表示名次下降。</p>
+      <div class="tablewrap"><table><thead><tr><th>比赛</th><th>股票</th><th>变化类型</th><th class="num">基线人数</th><th class="num">本次人数</th><th class="num">人数变化</th><th class="num" data-group-delta>百万组变化</th><th class="num" data-group-delta>千万组变化</th><th class="num">基线名次</th><th class="num">本次名次</th><th class="num">名次变化</th></tr></thead><tbody id="change-body"></tbody></table><div class="empty" id="change-empty" hidden></div></div>
+      <p class="legend" id="changes-legend">入榜 / 出榜表示进入 / 离开官方热门榜，不能解释为买入 / 清仓。榜外人数未知，显示 —，不填成 0。两档公开持仓人数分别显示基线与本次变化，缺少可比基线时显示 —。绿色箭头表示名次上升，红色箭头表示名次下降。</p>
       <h3 class="sectiongap">比赛参与人数变化</h3>
       <div class="tablewrap"><table><thead><tr><th>比赛 / 名单 ID</th><th class="num">基线参与人数</th><th class="num">本次参与人数</th><th class="num">变化</th></tr></thead><tbody id="participant-body"></tbody></table><div class="empty" id="participant-empty" hidden></div></div>
     </section>
@@ -107,7 +107,9 @@ const comparable=baseline&&comparison.aggregate_comparable===true;
 const first=!baseline, byKey=new Map(contests.map(c=>[String(c.contest_key),c]));
 const stockChanges=Array.isArray(comparison.stock_changes)?comparison.stock_changes:[];
 const selected=document.getElementById("contest-filter"), search=document.getElementById("search"), rankSort=document.getElementById("rank-sort");
-const weighting=meta.group_weighting||{}, groupWeights=weighting.weights||{}, groupLabels=weighting.labels||{};
+const groupCodes=["100","1000"], weighting=meta.group_weighting||{};
+const groupWeights=Object.fromEntries(groupCodes.map(code=>[code,(weighting.weights||{})[code]]));
+const groupLabels=Object.fromEntries(groupCodes.map(code=>[code,(weighting.labels||{})[code]||({"100":"百万组","1000":"千万组"})[code]]));
 const groupCollection=meta.group_collection||{};
 // A completed read can still fail identity or cross-source consistency checks.
 const groupReadComplete=groupCollection.read_complete===true||groupCollection.collection_complete===true;
@@ -148,7 +150,7 @@ else{append(notice,el("p",stats.review_status==="no_observable_change"?"与基�
 if(baseline&&meta.baseline_date===meta.report_date){append(notice,el("p","基线与本次快照位于同一天，本次显示同日快照差异，不称为跨日变化。"));}
 if(!hotOnly&&groupCollection.available!==true&&(groupReadComplete||groupWarnings.length)){
   notice.classList.add("warn");
-  append(notice,el("p",groupReadComplete?"四档公开持仓已读取，但加权口径校验未通过，本次暂停加权排序。":"四档分组公开持仓尚未全部读取，暂不启用加权排序。"));
+  append(notice,el("p",groupReadComplete?"两档公开持仓已读取，但加权口径校验未通过，本次暂停加权排序。":"两档分组公开持仓尚未全部读取，暂不启用加权排序。"));
   groupWarnings.forEach(warning=>append(notice,el("p",scalar(warning))));
 }
 const notes=document.getElementById("notes");
@@ -161,11 +163,11 @@ if(hotOnly){
 const sourced=contests.filter(c=>exists(c.source_updated_at)).map(c=>String(c.source_updated_at)).sort();
 if(sourced.length)notes.appendChild(el("p","热股榜来源时间："+time(sourced[0])+(sourced[0]===sourced[sourced.length-1]?"":" 至 "+time(sourced[sourced.length-1]))+"（北京时间）"));
 if(!hotOnly){
-notes.appendChild(el("p","四档分组采集覆盖："+ranking.filter(r=>weightedScore(r)!==null).length+" / "+ranking.length+" 只热榜股票可计算加权共识分；仅匹配各比赛原热门榜内的股票，榜外股票不参与本排行。"));
+notes.appendChild(el("p","两档分组采集覆盖："+ranking.filter(r=>weightedScore(r)!==null).length+" / "+ranking.length+" 只热榜股票可计算加权共识分；仅匹配各比赛原热门榜内的股票，榜外股票不参与本排行。"));
 notes.appendChild(el("p","分组人数只统计公开可读取的持仓；不推算未公开持仓。比赛间重复成员未去重。"));
 if(exists(groupCollection.completed_at))notes.appendChild(el("p",(groupReadComplete?"分组公开持仓读取完成时间：":"分组采集结束时间：")+time(groupCollection.completed_at)+"（北京时间）"));
-if(Object.keys(groupCollection.group_totals||{}).length===4&&numeric(groupCollection.member_count))notes.appendChild(el("p","四档合计读取覆盖："+number(groupCollection.completed_contest_count)+" / "+number(groupCollection.selected_contest_count)+" 场比赛均完成；已读 "+number(groupCollection.holdings_success_count)+" / "+number(groupCollection.member_count)+" 条组内成员记录，读取失败 "+number(groupCollection.holdings_failed_count)+" 条。各档分别读取，成员记录未跨比赛去重。"));
-Object.entries(groupCollection.group_totals||{}).forEach(([code,totals])=>notes.appendChild(el("p",(groupLabels[code]||("组 "+code))+"（权重 "+number(groupWeights[code])+"×）："+number(totals.member_count)+" 名组内成员，"+number(totals.holdings_success_count)+" 条公开持仓读取成功，覆盖 "+number(totals.completed_contest_count)+" / "+number(totals.selected_contest_count)+" 场。")));
+if(groupCodes.every(code=>Object.prototype.hasOwnProperty.call(groupCollection.group_totals||{},code))&&numeric(groupCollection.member_count))notes.appendChild(el("p","两档合计读取覆盖："+number(groupCollection.completed_contest_count)+" / "+number(groupCollection.selected_contest_count)+" 场比赛均完成；已读 "+number(groupCollection.holdings_success_count)+" / "+number(groupCollection.member_count)+" 条组内成员记录，读取失败 "+number(groupCollection.holdings_failed_count)+" 条。各档分别读取，成员记录未跨比赛去重。"));
+Object.entries(groupCollection.group_totals||{}).filter(([code])=>groupCodes.includes(code)).forEach(([code,totals])=>notes.appendChild(el("p",(groupLabels[code]||("组 "+code))+"（权重 "+number(groupWeights[code])+"×）："+number(totals.member_count)+" 名组内成员，"+number(totals.holdings_success_count)+" 条公开持仓读取成功，覆盖 "+number(totals.completed_contest_count)+" / "+number(totals.selected_contest_count)+" 场。")));
 if(weighting.scope)notes.appendChild(el("p",scalar(weighting.scope)));
 }
 contests.slice().sort((a,b)=>(Number(b.participant_count)||0)-(Number(a.participant_count)||0)).forEach(c=>{const o=el("option",(c.competition_name||c.contest_key)+" · "+number(c.participant_count)+" 人");o.value=String(c.contest_key);selected.appendChild(o);});
@@ -203,7 +205,7 @@ function rankingRows(){
   return rows.sort(compareRows).map((r,index)=>({...r,display_rank:selected.value&&sortState.key==="official"?r.official_rank:index+1})).filter(matchesStock);
 }
 function appendGroups(parent,counts,title){
-  const keys=counts&&typeof counts==="object"?Object.keys(counts).filter(k=>numeric(counts[k])):[];
+  const keys=counts&&typeof counts==="object"?groupCodes.filter(k=>numeric(counts[k])):[];
   if(!keys.length)return false;
   parent.appendChild(el("p",title,"group-caption"));
   const table=el("table",undefined,"group-breakdown"), head=el("thead"), h=el("tr"), body=el("tbody");
@@ -218,8 +220,8 @@ function detailsCell(row){const td=el("td",undefined,"summary-cell"), details=el
   items.slice().sort((a,b)=>(Number(b.holder_count)||0)-(Number(a.holder_count)||0)).forEach(c=>{const tr=el("tr");append(tr,el("td",c.competition_name||c.contest_key,"detailname"),el("td",number(c.holder_count),"num"),el("td",number(c.stock_rank),"num"),el("td",time(c.source_updated_at),"dim"));body.appendChild(tr);});append(table,head,body);details.appendChild(table);
   if(!hotOnly){
   const hasGroups=appendGroups(details,row.group_holder_counts,selected.value?"已采集的分组公开持仓人数":"跨比赛分组公开持仓人数合计（未去重）");
-  if(!hasGroups)details.appendChild(el("p",groupReadComplete?"四档持仓读取已完成；加权所需口径待核对，暂不显示分组人数。":"分组人数尚未采集；合计人数不能还原各档。","group-caption"));
-  else if(row.group_weighting_available!==true)details.appendChild(el("p",groupReadComplete?"四档持仓读取已完成，但口径待核对，暂不计算加权共识分。":"四档公开持仓尚未全部采集，暂不计算加权共识分。","group-caption"));
+  if(!hasGroups)details.appendChild(el("p",groupReadComplete?"两档持仓读取已完成；加权所需口径待核对，暂不显示分组人数。":"分组人数尚未采集；合计人数不能还原各档。","group-caption"));
+  else if(row.group_weighting_available!==true)details.appendChild(el("p",groupReadComplete?"两档持仓读取已完成，但口径待核对，暂不计算加权共识分。":"两档公开持仓尚未全部采集，暂不计算加权共识分。","group-caption"));
   }
   td.appendChild(details);return td;
 }
@@ -238,9 +240,9 @@ function renderWeightingNote(){const target=document.getElementById("weighting-n
   target.hidden=hotOnly;if(hotOnly)return;
   const available=ranking.some(r=>weightedScore(r)!==null);
   const schedule=Object.keys(groupWeights).sort((a,b)=>Number(a)-Number(b)).map(code=>(groupLabels[code]||("组 "+code))+" "+number(groupWeights[code])+"×").join("、");
-  if(numeric(groupCollection.member_count)&&(Number(groupCollection.member_count)>0||groupReadComplete))target.appendChild(el("p",groupReadComplete?number(groupCollection.completed_contest_count)+" 场比赛的四档公开持仓均读完，合计 "+number(groupCollection.holdings_success_count)+" 条成员记录。":number(groupCollection.completed_contest_count)+" / "+number(groupCollection.selected_contest_count)+" 场四档数据完成，已读 "+number(groupCollection.holdings_success_count)+" / "+number(groupCollection.member_count)+" 条成员记录。"));
-  target.appendChild(el("p","权重："+schedule+"；千万组最高。共识分 = 官方热榜持仓人数合计 + Σ((分组权重 − 1) × 该组公开持仓人数)。"));
-  target.appendChild(el("p",available?"这是混合来源的观察指标，不能视为精确分组总人数或资金额。展开明细可查看各档已采集的公开持仓。":groupReadComplete?"四档持仓读取已完成，但加权所需口径待核对；主榜以入榜比赛数排序，加权共识分显示‘口径待核对’。":"四档公开持仓尚未采集完整，主榜以入榜比赛数排序，加权共识分显示‘待采集分组’。"));
+  if(numeric(groupCollection.member_count)&&(Number(groupCollection.member_count)>0||groupReadComplete))target.appendChild(el("p",groupReadComplete?number(groupCollection.completed_contest_count)+" 场比赛的两档公开持仓均读完，合计 "+number(groupCollection.holdings_success_count)+" 条成员记录。":number(groupCollection.completed_contest_count)+" / "+number(groupCollection.selected_contest_count)+" 场两档数据完成，已读 "+number(groupCollection.holdings_success_count)+" / "+number(groupCollection.member_count)+" 条成员记录。"));
+  target.appendChild(el("p","权重："+schedule+"；千万组最高。共识分 = 官方热榜持仓人数合计 + Σ((分组权重 − 1) × 该组公开持仓人数)，仅对百万组与千万组增加权重；官方基数仍覆盖全赛。"));
+  target.appendChild(el("p",available?"这是混合来源的观察指标，不能视为精确分组总人数或资金额。展开明细可查看各档已采集的公开持仓。":groupReadComplete?"两档持仓读取已完成，但加权所需口径待核对；主榜以入榜比赛数排序，加权共识分显示‘口径待核对’。":"两档公开持仓尚未采集完整，主榜以入榜比赛数排序，加权共识分显示‘待采集分组’。"));
 }
 function renderRanking(){const body=document.getElementById("ranking-body");body.replaceChildren();const rows=rankingRows(), count=Number(stats.selected_contest_count)||1;
   sortControls();renderWeightingNote();
@@ -274,7 +276,7 @@ function renderChanges(){const chosenChanges=stockChanges.filter(c=>matchesConte
   const cards=document.getElementById("review-cards");cards.replaceChildren();[["共同比赛",baseline?((comparison.common_contest_keys||[]).filter(k=>!selected.value||String(k)===selected.value).length):null],["新入热门榜",baseline?chosenChanges.filter(c=>c.change_type==="new_hot_list").length:null],["退出热门榜",baseline?chosenChanges.filter(c=>c.change_type==="exited_hot_list").length:null]].forEach(([k,v])=>append(cards,append(el("div",undefined,"reviewitem"),el("div",k,"k"),el("div",number(v),"v"))));
   sampleSection();const body=document.getElementById("change-body");body.replaceChildren();
   if(baseline){visible.sort((a,b)=>({new_hot_list:0,exited_hot_list:1,changed:2,unchanged:3}[a.change_type]??4)-({new_hot_list:0,exited_hot_list:1,changed:2,unchanged:3}[b.change_type]??4)||Math.abs(Number(b.holder_count_delta)||0)-Math.abs(Number(a.holder_count_delta)||0)).forEach(c=>{const tr=el("tr"), type=el("td");type.appendChild(badge({changed:"人数 / 名次变化",unchanged:"未变化",new_hot_list:"新入热门榜",exited_hot_list:"退出热门榜"}[c.change_type]||c.change_type,c.change_type==="new_hot_list"?"active":""));
-    append(tr,contestCell(c),stockCell(c),type,el("td",number(c.previous_holder_count),"num"),el("td",number(c.holder_count),"num"),deltaCell(c.holder_count_delta));if(!hotOnly)append(tr,groupDeltaCell(c,"1"),groupDeltaCell(c,"10"),groupDeltaCell(c,"100"),groupDeltaCell(c,"1000"));append(tr,el("td",number(c.previous_stock_rank),"num"),el("td",number(c.stock_rank),"num"),deltaCell(c.stock_rank_delta,true));body.appendChild(tr);});}
+    append(tr,contestCell(c),stockCell(c),type,el("td",number(c.previous_holder_count),"num"),el("td",number(c.holder_count),"num"),deltaCell(c.holder_count_delta));if(!hotOnly)append(tr,...groupCodes.map(code=>groupDeltaCell(c,code)));append(tr,el("td",number(c.previous_stock_rank),"num"),el("td",number(c.stock_rank),"num"),deltaCell(c.stock_rank_delta,true));body.appendChild(tr);});}
   empty("change-empty",first||!visible.length,first?"首次建档，暂无比较基线。":term()||selected.value?"当前筛选下没有可显示的变化。":"共同比赛未观察到热门榜变化。可勾选显示未变化记录。");
   document.getElementById("show-unchanged").disabled=first;
   const people=document.getElementById("participant-body");people.replaceChildren();const participants=baseline?(comparison.contest_changes||[]).filter(matchesContest):[];

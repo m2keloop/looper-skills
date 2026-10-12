@@ -31,10 +31,10 @@ def weight_config():
     config = json.loads(WEIGHTS_PATH.read_text(encoding='utf-8'))
     weights = config.get('weights')
     if (not isinstance(config.get('version'), str) or not config['version']
-            or not isinstance(weights, dict) or set(weights) != {'1', '10', '100', '1000'}
-            or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            or not isinstance(weights, dict) or set(weights) != {'100', '1000'}
+            or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
                    for value in weights.values())
-            or len(set(weights.values())) != 4
+            or len(set(weights.values())) != 2
             or weights['1000'] != max(weights.values())):
         raise SourceError('Invalid consensus-weights configuration')
     return {'weight_version': config['version'], 'weights': weights}

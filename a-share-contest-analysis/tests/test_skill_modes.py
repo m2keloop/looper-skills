@@ -30,7 +30,7 @@ class PortableModeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(run.call_args.args[0].hot_only)
 
-    def test_four_tiers_require_explicit_mode(self):
+    def test_large_capital_tiers_require_explicit_mode(self):
         result, run = self.invoke(["--capital-groups"])
         self.assertEqual(result, 0)
         self.assertFalse(run.call_args.args[0].hot_only)

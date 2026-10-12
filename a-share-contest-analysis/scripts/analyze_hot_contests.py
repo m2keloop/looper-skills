@@ -2,6 +2,7 @@
 """Offline review of complete official contest hot-list snapshots (standard library)."""
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -12,12 +13,14 @@ from zoneinfo import ZoneInfo
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_PATH = ROOT / "data" / "consensus-weights.json"
+ACTIVE_GROUP_CODES = ("100", "1000")
+WEIGHTING_MODEL_VERSION = "public-large-capital-groups-v2"
 DEFAULT_WEIGHTS = {
-    "version": "public-capital-groups-v1",
-    "weights": {"1": 1, "10": 2, "100": 3, "1000": 5},
-    "labels": {"1": "新手组", "10": "十万组", "100": "百万组", "1000": "千万组"},
+    "version": WEIGHTING_MODEL_VERSION,
+    "weights": {"100": 3, "1000": 5},
+    "labels": {"100": "百万组", "1000": "千万组"},
     "formula": "官方热榜持仓人数合计 + Σ((分组权重 - 1) × 该组公开持仓人数)",
-    "scope": "完整读取新手组、十万组、百万组、千万组名单及公开持仓，仅匹配本次官方热榜股票；分数为混合来源观察指标，不是精确分组总人数、资金金额或去重人数。",
+    "scope": "仅分档采集百万组、千万组完整名单及公开持仓；基础官方热榜人数仍为全赛总量，仅对两组公开人数追加权重，并非已剔除其他金额组的纯持仓榜。仅匹配本次官方热榜股票；分数为混合来源观察指标，不是精确分组总人数、资金金额或去重人数。",
 }
 COMPATIBILITY_FIELDS = ("threshold", "scope", "stock_scope", "selection_rule")
 NOTES = [
@@ -43,24 +46,80 @@ def validate_weights(value):
     if not isinstance(value, dict) or not isinstance(value.get("version"), str) or not value["version"]:
         raise ValueError("共识权重必须有非空版本号")
     weights = value.get("weights")
-    if not isinstance(weights, dict) or set(weights) != {"1", "10", "100", "1000"}:
-        raise ValueError("共识权重必须包含新手、十万、百万、千万四组")
+    if not isinstance(weights, dict) or set(weights) != set(ACTIVE_GROUP_CODES):
+        raise ValueError("共识权重只能包含百万组和千万组")
     if any(type(w) not in (int, float) or not math.isfinite(w) or w <= 0 for w in weights.values()):
         raise ValueError("共识权重必须是有限正数")
-    legacy_thousand_only = (value["version"] == "public-thousand-v1"
-                            and weights == {"1": 1, "10": 1, "100": 1, "1000": 5})
-    if (not legacy_thousand_only and len(set(weights.values())) != 4) or weights["1000"] != max(weights.values()):
-        raise ValueError("四组权重必须各不相同，且千万组权重严格最高")
+    if weights["1000"] <= weights["100"]:
+        raise ValueError("千万组权重必须严格高于百万组")
+    if "active_group_codes" in value and value["active_group_codes"] != list(ACTIVE_GROUP_CODES):
+        raise ValueError("活动组别必须为百万组和千万组")
+    if "weighting_model_version" in value and value["weighting_model_version"] != WEIGHTING_MODEL_VERSION:
+        raise ValueError("当前权重模型版本不一致")
+    labels = value.get("labels", {})
+    if not isinstance(labels, dict):
+        raise ValueError("组别名称必须是对象")
     return {**DEFAULT_WEIGHTS, **value, "weights": dict(weights),
-            "labels": {**DEFAULT_WEIGHTS["labels"], **value.get("labels", {})}}
+            "labels": {code: labels.get(code, DEFAULT_WEIGHTS["labels"][code])
+                       for code in ACTIVE_GROUP_CODES},
+            "active_group_codes": list(ACTIVE_GROUP_CODES),
+            "weighting_model_version": WEIGHTING_MODEL_VERSION}
+
+
+def validate_historical_weight_stamp(value):
+    """Read an old stamp for raw observations, never as the active score model."""
+    if isinstance(value, dict) and set(value.get("weights", {})) == set(ACTIVE_GROUP_CODES):
+        return validate_weights(value)
+    if not isinstance(value, dict) or not isinstance(value.get("version"), str) or not value["version"]:
+        raise ValueError("历史补采权重缺少版本号")
+    weights = value.get("weights")
+    if not isinstance(weights, dict) or set(weights) != {"1", "10", "100", "1000"}:
+        raise ValueError("历史补采权重格式无效")
+    if any(type(w) not in (int, float) or not math.isfinite(w) or w <= 0 for w in weights.values()):
+        raise ValueError("历史补采权重必须是有限正数")
+    legacy_thousand = (value["version"] == "public-thousand-v1"
+                       and weights == {"1": 1, "10": 1, "100": 1, "1000": 5})
+    if not legacy_thousand and (len(set(weights.values())) != 4 or weights["1000"] != max(weights.values())):
+        raise ValueError("历史补采权重格式无效")
+    return {"version": value["version"], "weights": dict(weights),
+            "active_group_codes": ["1", "10", "100", "1000"],
+            "weighting_model_version": "legacy-four-capital-groups"}
 
 
 def load_weights():
     return validate_weights(read_json(WEIGHTS_PATH) if WEIGHTS_PATH.exists() else DEFAULT_WEIGHTS)
 
 
+def snapshot_fingerprint(snapshot):
+    """Use the collector's byte-level identity, including the official roster."""
+    digest = hashlib.sha256()
+    for filename in ("manifest.json", "catalog.json", "all-hot-stocks.json"):
+        digest.update((snapshot["path"] / filename).read_bytes())
+    return digest.hexdigest()
+
+
+def validate_group_date_identity(meta, snapshot, fingerprint, label):
+    """A supplement must observe the same Shanghai date as its immutable base."""
+    manifest = snapshot["manifest"]
+    base_date = timestamp(manifest["completed_at"]).date().isoformat()
+    collection_date = meta.get("collection_date")
+    if (not isinstance(collection_date, str)
+            or date.fromisoformat(collection_date).isoformat() != collection_date
+            or collection_date != base_date):
+        raise ValueError(f"{label}采集日期缺失、无效或与基础热榜日期不一致")
+    if timestamp(meta["completed_at"]).date().isoformat() != base_date:
+        raise ValueError(f"{label}实际完成日期与基础热榜日期不一致")
+    if (type(meta.get("schema_version")) is not int or meta["schema_version"] != 1
+            or meta.get("base_run_id") != manifest["run_id"]):
+        raise ValueError(f"{label}与当前热榜快照身份不一致")
+    if "base_completed_at" in meta and meta["base_completed_at"] != manifest["completed_at"]:
+        raise ValueError(f"{label}基础快照完成时间不一致")
+    if "base_fingerprint" in meta and meta["base_fingerprint"] != fingerprint:
+        raise ValueError(f"{label}基础快照指纹不一致")
+
+
 def load_capital_groups(snapshot, weights, path):
-    """Validate every amount tier as one atomic supplement before weighting stocks."""
+    """Validate both active amount tiers atomically before weighting stocks."""
     labels = weights["labels"]
     state = {"available": False, "collection_complete": False, "records": {}, "completed_at": None,
              "scope": weights["scope"], "source_snapshot_run_id": snapshot["manifest"]["run_id"],
@@ -68,17 +127,25 @@ def load_capital_groups(snapshot, weights, path):
              "completed_contest_count": 0, "member_count": 0, "holdings_success_count": 0,
              "holdings_failed_count": 0, "record_count": 0,
              "expected_record_count": len(snapshot["rows"]), "contests": [], "warnings": [],
-             "baseline_eligible": False, "read_complete": False}
+             "baseline_eligible": False, "read_complete": False,
+             "active_group_codes": list(ACTIVE_GROUP_CODES),
+             "weighting_model_version": WEIGHTING_MODEL_VERSION}
     try:
         payload = read_json(path)
         meta, groups = payload["metadata"], payload["groups"]
         if meta.get("schema_version") != 1 or meta.get("base_run_id") != snapshot["manifest"]["run_id"]:
             raise ValueError("分组持仓与当前热榜快照不一致")
-        if meta.get("collection_complete") is not True or set(groups) != {"1", "10", "100", "1000"}:
-            raise ValueError("四档公开持仓尚未全部采集成功")
-        timestamp(meta["completed_at"])
+        if meta.get("collection_complete") is not True or set(groups) != set(ACTIVE_GROUP_CODES):
+            raise ValueError("百万组和千万组公开持仓必须全部采集成功；历史组别不能代替当前两组模型")
+        if "active_group_codes" in meta and meta["active_group_codes"] != list(ACTIVE_GROUP_CODES):
+            raise ValueError("补采活动组别与当前两组模型不一致")
+        if "weighting_model_version" in meta and meta["weighting_model_version"] != WEIGHTING_MODEL_VERSION:
+            raise ValueError("补采模型版本与当前两组模型不一致")
+        fingerprint = snapshot_fingerprint(snapshot)
+        validate_group_date_identity(meta, snapshot, fingerprint, "两档合并数据")
         read_summaries = {code: group["metadata"] for code, group in groups.items()}
         for code, summary in read_summaries.items():
+            validate_group_date_identity(summary, snapshot, fingerprint, labels[code])
             if (summary.get("collection_complete") is not True
                     or any(type(summary.get(k)) is not int or summary[k] < 0
                            for k in ("member_count", "holdings_success_count", "holdings_failed_count"))
@@ -109,7 +176,6 @@ def load_capital_groups(snapshot, weights, path):
             if (group_meta.get("group_code") != code or group_meta.get("base_run_id") != meta["base_run_id"]
                     or group_meta.get("collection_complete") is not True):
                 raise ValueError(f"{label}公开持仓未完整覆盖当前快照")
-            timestamp(group_meta["completed_at"])
             by_key = {}
             for contest in group["contests"]:
                 key = contest["contest_key"]
@@ -145,12 +211,12 @@ def load_capital_groups(snapshot, weights, path):
                 seen.add(identity)
             if seen != set(base_rows):
                 raise ValueError(f"{label}记录未逐条覆盖当前官方热榜股票")
-        completed_at = max(group_totals[c]["completed_at"] for c in groups)
+        completed_at = max((group_totals[c]["completed_at"] for c in groups), key=timestamp)
         for identity, row in base_rows.items():
             counts = combined[identity]["group_holder_counts"]
             public_sum = sum(counts.values())
             if public_sum > row["holder_count"]:
-                raise ValueError("四组公开持仓人数之和高于官方热榜人数；来源或时点口径不一致")
+                raise ValueError("两组公开持仓人数之和高于官方热榜人数；来源或时点口径不一致")
             combined[identity].update(market=identity[1], group_holder_counts=counts,
                                       thousand_holder_count=counts["1000"])
         state.update(available=True, collection_complete=True, read_complete=True, completed_at=completed_at,
@@ -174,7 +240,9 @@ def load_group_collection(snapshot, weights, hot_only=False):
              "selected_contest_count": len(snapshot["selected"]), "completed_contest_count": 0,
              "member_count": 0, "holdings_success_count": 0, "holdings_failed_count": 0,
              "record_count": 0, "expected_record_count": len(snapshot["rows"]),
-             "contests": [], "warnings": []}
+             "contests": [], "warnings": [],
+             "active_group_codes": list(ACTIVE_GROUP_CODES),
+             "weighting_model_version": WEIGHTING_MODEL_VERSION}
     if hot_only:
         return state
     capital_path = snapshot["path"] / "group-holdings.json"
@@ -182,7 +250,7 @@ def load_group_collection(snapshot, weights, hot_only=False):
         return load_capital_groups(snapshot, weights, capital_path)
     path = snapshot["path"] / "thousand-group.json"
     if not path.exists():
-        state["warnings"].append("缺少四档完整公开持仓数据，暂按入榜比赛数排序；加权分数不可计算。")
+        state["warnings"].append("缺少百万组和千万组完整公开持仓数据，暂按入榜比赛数排序；加权分数不可计算。")
         return state
     try:
         payload = read_json(path)
@@ -207,7 +275,7 @@ def load_group_collection(snapshot, weights, hot_only=False):
             raise ValueError("千万组公开持仓尚未全部采集成功")
         timestamp(meta["completed_at"])
         if "weight_version" in meta or "weights" in meta:
-            state["weight_stamp"] = validate_weights({
+            state["weight_stamp"] = validate_historical_weight_stamp({
                 "version": meta.get("weight_version"), "weights": meta.get("weights")})
         by_key = {}
         for contest in contests:
@@ -242,7 +310,7 @@ def load_group_collection(snapshot, weights, hot_only=False):
         if set(supplement) != set(base_rows):
             raise ValueError("千万组记录未逐条覆盖当前官方热榜股票")
         state.update(thousand_group_complete=True, records=supplement, baseline_eligible=True)
-        state["warnings"].append("历史快照只采集了千万组，不能代替四档分组数据；完整加权分暂不可计算，该快照仍可比较官方人数。")
+        state["warnings"].append("历史快照只采集了千万组，缺少百万组，完整加权分不可计算；该快照仍可比较官方人数。")
     except (ValueError, KeyError, TypeError, AttributeError, OSError) as error:
         state["warnings"].append(f"千万组加权不可用：{error}。保留官方热榜及比赛覆盖排序，加权分数留空。")
     return state
@@ -324,12 +392,12 @@ def choose_baseline(root, current, report_date, hot_only=False):
                 and snapshot["completed"] < current["completed"]
                 and all(snapshot["manifest"].get(k) == current["manifest"].get(k)
                         for k in COMPATIBILITY_FIELDS)):
-            has_supplement = (snapshot["path"] / "thousand-group.json").exists()
+            has_supplement = any((snapshot["path"] / filename).exists()
+                                 for filename in ("thousand-group.json", "group-holdings.json"))
             group = load_group_collection(snapshot, weights, hot_only) if has_supplement else None
-            # A base hot list can be complete even though the later group stage
-            # failed. Such a run must not displace a successfully usable baseline.
-            if not hot_only and has_supplement and not group.get("baseline_eligible", False):
-                continue
+            # The official base remains comparable even after a supplement fails
+            # or the amount-tier model changes. Prefer a compatible weighted base
+            # only when the current report also has valid weights.
             candidates.append(snapshot)
             if group and group["available"]:
                 weighted_candidates.append(snapshot)
@@ -401,7 +469,9 @@ def build_analysis(current, baseline=None, report_date=None, hot_only=False):
     weight_compatible = bool(previous_group and group["available"] and previous_group["available"]
                              and previous_group["weight_stamp"]
                              and weights["version"] == previous_weights["version"]
-                             and weights["weights"] == previous_weights["weights"])
+                             and weights["weights"] == previous_weights["weights"]
+                             and group["active_group_codes"] == previous_group["active_group_codes"]
+                             and group["weighting_model_version"] == previous_group["weighting_model_version"])
     rank_comparable = same_sample and method_compatible and (ranking_method == "contest_coverage" or weight_compatible)
     ranking = aggregate(current["rows"], group, weights)
     previous = {(r["market"], r["stock_code"]): r
@@ -444,7 +514,10 @@ def build_analysis(current, baseline=None, report_date=None, hot_only=False):
         old_counts = old_record.get("group_holder_counts", {})
         new_counts = new_record.get("group_holder_counts", {})
         old_thousand, new_thousand = old_counts.get("1000"), new_counts.get("1000")
-        group_comparable = bool(before and now and old_counts and new_counts)
+        group_comparable = bool(before and now and old_counts and new_counts
+                                and group["available"] and previous_group["available"]
+                                and previous_group["active_group_codes"] == group["active_group_codes"]
+                                and previous_group["weighting_model_version"] == group["weighting_model_version"])
         record_score_comparable = bool(before and now and weight_compatible)
         comparable_codes = old_counts.keys() & new_counts.keys()
         group_count_deltas = {code: new_counts[code] - old_counts[code] for code in comparable_codes} if group_comparable else {}
@@ -491,7 +564,7 @@ def build_analysis(current, baseline=None, report_date=None, hot_only=False):
     notes += group["warnings"]
     if group["available"]:
         weights_text = "、".join(f"{weights['labels'][code]} {weights['weights'][code]}×"
-                                 for code in ("1", "10", "100", "1000"))
+                                 for code in ACTIVE_GROUP_CODES)
         notes += [weights["scope"], f"各组权重：{weights_text}；"
                   "共识分 = 官方热榜人数 + 各组 Σ((该组权重 − 1) × 该组公开持仓人数)。"]
     if baseline and not method_compatible:
@@ -499,7 +572,7 @@ def build_analysis(current, baseline=None, report_date=None, hot_only=False):
     elif baseline and ranking_method == "weighted_consensus" and not weight_compatible:
         notes += ["基线分组权重版本/数值不同或缺少采集权重戳，加权分数和综合名次日差停算。"]
     elif baseline and ranking_method == "weighted_consensus":
-        notes += ["加权分数及加权主榜名次日差还要求两日四组采集完整、权重兼容、比赛样本相同，且该股票覆盖的比赛集合相同。"]
+        notes += ["加权分数及加权主榜名次日差还要求两日百万组和千万组采集完整、模型与权重兼容、比赛样本相同，且该股票覆盖的比赛集合相同。"]
     for contest in contests:
         if not contest["qualifies"]:
             continue
@@ -521,6 +594,8 @@ def build_analysis(current, baseline=None, report_date=None, hot_only=False):
         "baseline_completed_at": baseline["manifest"]["completed_at"] if baseline else None,
         "baseline_date": baseline["date"] if baseline else None, "comparison_status": status,
         "ranking_method": ranking_method,
+        "active_group_codes": list(ACTIVE_GROUP_CODES),
+        "weighting_model_version": WEIGHTING_MODEL_VERSION,
         "collection_mode": "official_hot_lists" if hot_only else "capital_groups",
         "group_weighting": {**weights, "enabled": not hot_only, "collection_complete": group["available"],
                             "completed_at": group["completed_at"], "source_snapshot_run_id": manifest["run_id"]},
@@ -583,12 +658,12 @@ def markdown(analysis):
                 text += [label + "：" + "、".join(c["competition_name"] for c in analysis["comparison"][key]) + "。", ""]
     weighted = meta["ranking_method"] == "weighted_consensus"
     hot_only = meta.get("collection_mode") == "official_hot_lists"
-    order = "按加权共识分、入榜比赛数、各比赛持仓人数之和排序。" if weighted else "四档分组数据尚不可用，按入榜比赛数、各比赛持仓人数之和排序；加权分数留空。"
+    order = "按加权共识分、入榜比赛数、各比赛持仓人数之和排序。" if weighted else "百万组和千万组数据尚不可用，按入榜比赛数、各比赛持仓人数之和排序；加权分数留空。"
     if hot_only:
         order = "本次仅使用官方热股榜，按入榜比赛数、各比赛持仓人数之和排序；不计算金额分档权重。"
         columns = ["| 排名 | 股票 | 代码 | 入榜比赛数 | 各比赛持仓人数之和 | 人数变化 |", "|---:|---|---|---:|---:|---:|"]
     else:
-        columns = ["| 排名 | 股票 | 代码 | 加权共识分 | 新手组 | 十万组 | 百万组 | 千万组 | 入榜比赛数 | 各比赛持仓人数之和 | 分数变化 |", "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        columns = ["| 排名 | 股票 | 代码 | 加权共识分 | 百万组 | 千万组 | 入榜比赛数 | 各比赛持仓人数之和 | 分数变化 |", "|---:|---|---|---:|---:|---:|---:|---:|---:|"]
     text += ["## 热股排行", "", order, "", *columns]
     for row in analysis["ranking"][:15]:
         if hot_only:
@@ -597,7 +672,7 @@ def markdown(analysis):
             continue
         score, delta = ("—" if row[k] is None else str(row[k]) for k in ("weighted_consensus_score", "score_delta"))
         counts = row.get("group_holder_counts", {})
-        group_cells = [str(counts.get(code, "—")) for code in ("1", "10", "100", "1000")]
+        group_cells = [str(counts.get(code, "—")) for code in ACTIVE_GROUP_CODES]
         text += [f"| {row['rank']} | {row['stock_name']} | {row['stock_code']} | {score} | {' | '.join(group_cells)} | {row['contest_count']} | {row['holder_count_sum']} | {delta} |"]
     text += ["", "## 比赛名单", "", "| 比赛 | key | 参与人数 | 入选 | 采集状态 | 源时间 |", "|---|---|---:|---|---|---|"]
     for row in analysis["contests"]:
@@ -605,7 +680,7 @@ def markdown(analysis):
                  f"{'是' if row['qualifies'] else '否'} | {row['collection_status']} | {row.get('source_updated_at', '—')} |"]
     if analysis["comparison"]["stock_changes"]:
         columns = (["| 比赛 | 股票 | 变更 | 官方人数变化 | 官方名次变化 |", "|---|---|---|---:|---:|"] if hot_only else
-                   ["| 比赛 | 股票 | 变更 | 官方人数变化 | 新手组变化 | 十万组变化 | 百万组变化 | 千万组变化 | 官方名次变化 | 共识分变化 |", "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"])
+                   ["| 比赛 | 股票 | 变更 | 官方人数变化 | 百万组变化 | 千万组变化 | 官方名次变化 | 共识分变化 |", "|---|---|---|---:|---:|---:|---:|---:|"])
         text += ["", "## 每日变更", "", *columns]
         labels = {"changed": "数值变化", "new_hot_list": "新上榜", "exited_hot_list": "退出热榜"}
         for row in analysis["comparison"]["stock_changes"]:
@@ -614,7 +689,7 @@ def markdown(analysis):
             values = ["—" if row["holder_count_delta"] is None else str(row["holder_count_delta"])]
             if not hot_only:
                 values.extend("—" if row.get("group_holder_counts_delta", {}).get(code) is None else str(row["group_holder_counts_delta"][code])
-                              for code in ("1", "10", "100", "1000"))
+                              for code in ACTIVE_GROUP_CODES)
             values.extend("—" if row[k] is None else str(row[k]) for k in (("stock_rank_delta",) if hot_only else ("stock_rank_delta", "weighted_score_delta")))
             text += [f"| {row['competition_name']} | {row['stock_name']} {row['stock_code']} | "
                      f"{labels[row['change_type']]} | {' | '.join(values)} |"]
@@ -640,24 +715,24 @@ def write_report(analysis, root, publish=True):
                    "previous_thousand_holder_count", "thousand_holder_count_delta",
                    "previous_rank", "rank_delta", "previous_contest_count", "contest_count_delta",
                    "previous_holder_count_sum", "holder_count_sum_delta",
-                   *[f"group_holder_count_{code}" for code in ("1", "10", "100", "1000")]]
+                   *[f"group_holder_count_{code}" for code in ACTIVE_GROUP_CODES]]
     ranked_rows = [{**row, **{f"group_holder_count_{code}": row.get("group_holder_counts", {}).get(code)
-                               for code in ("1", "10", "100", "1000")}}
+                               for code in ACTIVE_GROUP_CODES}}
                    for row in analysis["ranking"]]
     csv_file(output / "hot-stock-ranking.csv", ranked_rows, rank_fields)
     change_fields = ["contest_key", "competition_name", "market", "stock_code", "stock_name", "change_type",
                      "previous_holder_count", "holder_count", "holder_count_delta", "previous_stock_rank", "stock_rank", "stock_rank_delta",
                      "previous_thousand_holder_count", "thousand_holder_count", "thousand_holder_count_delta", "weighted_score_delta", "group_count_changed",
-                     *[f"previous_group_holder_count_{code}" for code in ("1", "10", "100", "1000")],
-                     *[f"group_holder_count_{code}" for code in ("1", "10", "100", "1000")],
-                     *[f"group_holder_count_delta_{code}" for code in ("1", "10", "100", "1000")]]
+                     *[f"previous_group_holder_count_{code}" for code in ACTIVE_GROUP_CODES],
+                     *[f"group_holder_count_{code}" for code in ACTIVE_GROUP_CODES],
+                     *[f"group_holder_count_delta_{code}" for code in ACTIVE_GROUP_CODES]]
     change_rows = [{**row,
                     **{f"previous_group_holder_count_{code}": row.get("previous_group_holder_counts", {}).get(code)
-                       for code in ("1", "10", "100", "1000")},
+                       for code in ACTIVE_GROUP_CODES},
                     **{f"group_holder_count_{code}": row.get("group_holder_counts", {}).get(code)
-                       for code in ("1", "10", "100", "1000")},
+                       for code in ACTIVE_GROUP_CODES},
                     **{f"group_holder_count_delta_{code}": row.get("group_holder_counts_delta", {}).get(code)
-                       for code in ("1", "10", "100", "1000")}}
+                       for code in ACTIVE_GROUP_CODES}}
                    for row in analysis["comparison"]["stock_changes"]]
     csv_file(output / "changes.csv", change_rows, change_fields)
     csv_file(output / "contests.csv", analysis["contests"], [
@@ -675,9 +750,9 @@ def write_report(analysis, root, publish=True):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshots", type=Path, default=ROOT / "exports/hot-contests")
+    parser.add_argument("--snapshots", type=Path, default=ROOT / "exports" / "hot-contests")
     parser.add_argument("--snapshot", type=Path)
-    parser.add_argument("--report-root", type=Path, default=ROOT / "exports/hot-contest-analysis")
+    parser.add_argument("--report-root", type=Path, default=ROOT / "exports" / "hot-contest-analysis")
     parser.add_argument("--date", help="报告日期 YYYY-MM-DD，默认快照完成时间的上海日期")
     parser.add_argument("--no-publish", action="store_true", help="生成独立报告但不更新 latest 指针")
     parser.add_argument("--hot-only", action="store_true", help="仅分析官方热股榜；不加载历史分组持仓或计算分组权重")

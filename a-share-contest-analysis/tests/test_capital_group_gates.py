@@ -17,7 +17,8 @@ class CapitalGroupGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             completed = "2026-10-10T16:30:00+08:00"
-            config = {"version": "four-tier-fixture", "weights": {"1": 1, "10": 2, "100": 3, "1000": 5}}
+            config = {"version": "public-large-capital-groups-v2", "weights": {"100": 3, "1000": 5}}
+            old_stamp = {"version": "public-capital-groups-v1", "weights": {"1": 1, "10": 2, "100": 3, "1000": 5}}
             config_path = root / "consensus-weights.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             manifest = {"run_id": "only-thousand-fixture", "completed_at": completed,
@@ -35,8 +36,8 @@ class CapitalGroupGateTests(unittest.TestCase):
             supplement = {
                 "metadata": {"schema_version": 1, "base_run_id": manifest["run_id"],
                              "group_code": "1000", "collection_complete": True,
-                             "completed_at": completed, "weight_version": config["version"],
-                             "weights": config["weights"]},
+                             "completed_at": completed, "weight_version": old_stamp["version"],
+                             "weights": old_stamp["weights"]},
                 "contests": [{"contest_key": contest["contest_key"], "member_count": 2,
                               "holdings_success_count": 2, "holdings_failed_count": 0,
                               "ranking_complete": True, "collection_complete": True}],
@@ -54,6 +55,8 @@ class CapitalGroupGateTests(unittest.TestCase):
                 group = analysis.load_group_collection(snapshot, analysis.load_weights())
                 self.assertFalse(group["available"])
                 self.assertFalse(group["collection_complete"])
+                self.assertTrue(group["baseline_eligible"])
+                self.assertEqual(group["records"][("fixture-contest", "1", "000001")]["thousand_holder_count"], 2)
                 report = analysis.build_analysis(snapshot)
             self.assertFalse(report["summary"]["group_weighting_available"])
             self.assertEqual(report["metadata"]["ranking_method"], "contest_coverage")
