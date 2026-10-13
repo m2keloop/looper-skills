@@ -30,6 +30,10 @@ class AccessLimited(SourceError):
     pass
 
 
+class RequestsStopped(SourceError):
+    pass
+
+
 def now():
     return datetime.now(TZ).isoformat(timespec='seconds')
 
@@ -51,14 +55,19 @@ def timestamp(value):
 
 
 class PublicClient:
-    def __init__(self, interval):
+    def __init__(self, interval, stop_event=None):
         self.interval = interval
         self.last_started = 0
         self.events = []
+        self.stop_event = stop_event
 
     def request(self, url):
         for attempt in range(1, 4):
-            time.sleep(max(0, self.last_started + self.interval - time.monotonic()))
+            delay = max(0, self.last_started + self.interval - time.monotonic())
+            if self.stop_event is None:
+                time.sleep(delay)
+            elif self.stop_event.wait(delay):
+                raise RequestsStopped('Concurrent collection stopped; request not started')
             self.last_started = time.monotonic()
             result = subprocess.run([
                 'curl', '-sS', '--connect-timeout', '10', '--max-time', '25',
@@ -76,6 +85,8 @@ class PublicClient:
                      'http_status': status, 'curl_exit_code': result.returncode}
             self.events.append(event)
             if status in ('403', '429'):
+                if self.stop_event is not None:
+                    self.stop_event.set()
                 raise AccessLimited(f'HTTP {status}: stopped; no further source requests')
             if result.returncode == 0 and status == '200':
                 try:
@@ -84,7 +95,10 @@ class PublicClient:
                     raise SourceError('HTTP 200 response is not JSON') from error
             if result.returncode != 0 or status == '408' or status.startswith('5'):
                 if attempt < 3:
-                    time.sleep(attempt * 2)
+                    if self.stop_event is None:
+                        time.sleep(attempt * 2)
+                    elif self.stop_event.wait(attempt * 2):
+                        raise RequestsStopped('Concurrent collection stopped; retry not started')
                     continue
             raise SourceError(f'Request failed: HTTP {status or "unknown"}, curl exit {result.returncode}')
 
@@ -277,8 +291,8 @@ def main():
     parser.add_argument('--registry', type=Path, default=ROOT / 'data' / 'contest-registry.json')
     try:
         args = parser.parse_args()
-        if args.threshold < 0 or args.interval < 2 or not args.interval < float('inf'):
-            parser.error('threshold must be >=0; interval must be finite and >=2 seconds')
+        if args.threshold < 0 or args.interval < 1 or not args.interval < float('inf'):
+            parser.error('threshold must be >=0; interval must be finite and >=1 second')
     except SystemExit as error:
         if error.code == 2:
             return 1

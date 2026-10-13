@@ -120,6 +120,31 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0], "collect_hot_contests.py")
         self.assert_preserved()
 
+    def test_parallel_option_reaches_only_million_collection_and_failure_keeps_report(self):
+        self.args.analyze_only = False
+        self.args.million_workers = 2
+        calls = {}
+
+        def command(name, arguments):
+            calls[name] = arguments
+            if name == 'collect_hot_contests.py':
+                return subprocess.CompletedProcess(arguments, 0,
+                    json.dumps({'run_directory': str(self.snapshot)}) + '\n', '')
+            if name == 'collect_thousand_group.py':
+                return subprocess.CompletedProcess(arguments, 0, '', '')
+            if name == 'collect_capital_groups.py':
+                return subprocess.CompletedProcess(arguments, 2, '', 'HTTP 429')
+            raise AssertionError('Failed parallel collection must not reach analysis')
+
+        with patch.object(sync, 'command', side_effect=command):
+            self.assertEqual(self.invoke(), 2)
+        self.assertNotIn('--workers', calls['collect_hot_contests.py'])
+        self.assertNotIn('--workers', calls['collect_thousand_group.py'])
+        self.assertEqual(calls['collect_capital_groups.py'][-2:], ['--workers', '2'])
+        self.assert_preserved()
+        status = json.loads((self.reports / 'sync-latest.json').read_text())
+        self.assertEqual(status['million_holding_workers'], 2)
+
     def test_thousand_group_failure_keeps_published_report(self):
         self.args.analyze_only = False
         calls = []

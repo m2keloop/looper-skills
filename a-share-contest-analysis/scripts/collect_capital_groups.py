@@ -8,13 +8,15 @@ import math
 import re
 import shutil
 import sys
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from analyze_hot_contests import load_capital_groups, read_snapshot, validate_weights
-from collect_hot_contests import AccessLimited, PublicClient, SourceError, now, official_url, save, source_data
+from collect_hot_contests import AccessLimited, PublicClient, RequestsStopped, SourceError, now, official_url, save, source_data
 
 ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_PATH = ROOT / 'data' / 'consensus-weights.json'
@@ -214,26 +216,76 @@ def read_existing_thousand(snapshot):
                         for row in payload['records']]}
 
 
-def check_holdings_time_budget(snapshot, checkpoint, contests, code, interval):
+def check_holdings_time_budget(snapshot, checkpoint, contests, code, interval, workers=1):
     """Use the completed official rosters, never estimates for missing members."""
     validate_collection_identity(snapshot, checkpoint['metadata'])
     pending = sum(entry['holdings'].get(uid, {}).get('status') != 'success'
                   for contest in contests
                   for entry in [checkpoint['contests'][contest['contest_key']]]
                   for uid in entry['members'])
-    minimum_seconds = max(pending - 1, 0) * interval
+    minimum_seconds = max(math.ceil(pending / workers) - 1, 0) * interval
     current = collection_timestamp(now())
     midnight = current.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     remaining_seconds = (midnight - current).total_seconds()
     if minimum_seconds >= remaining_seconds:
         raise SourceError(
             f'{GROUPS[code]}本次完整官方名单尚有 {pending} 条公开持仓待读取；'
-            f'按 {interval:g} 秒串行间隔至少需要 {minimum_seconds:g} 秒'
+            f'按 {workers} 路、每路 {interval:g} 秒间隔至少需要 {minimum_seconds:g} 秒'
             f'（{minimum_seconds / 3600:.2f} 小时），当天剩余 {remaining_seconds:g} 秒'
             f'（{remaining_seconds / 3600:.2f} 小时）；保留检查点，不生成加权报告')
 
 
-def collect_group(snapshot, code, client, interval):
+def collect_positions_parallel(contest, entry, mapping, raw, pending, code,
+                               interval, workers, checkpoint_path, checkpoint, client, worker_clients):
+    """Workers fetch; only the coordinator commits checkpoint results."""
+    stop_event = threading.Event()
+    clients = worker_clients
+    for worker_client in clients:
+        worker_client.stop_event = stop_event
+    stopped = False
+    completed = 0
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            try:
+                for offset in range(0, len(pending), workers):
+                    futures = {pool.submit(collect_position, clients[i], contest['contest_key'],
+                                           uid, mapping, raw): uid
+                               for i, uid in enumerate(pending[offset:offset + workers])}
+                    for future in as_completed(futures):
+                        uid = futures[future]
+                        try:
+                            value = future.result()
+                        except RequestsStopped:
+                            stopped = True
+                            continue
+                        except AccessLimited as error:
+                            stop_event.set()
+                            stopped = True
+                            value = {'status': 'failed', 'error': str(error), 'fetched_at': now()}
+                        except (SourceError, OSError) as error:
+                            value = {'status': 'failed', 'error': str(error), 'fetched_at': now()}
+                        entry['holdings'][uid] = value
+                        completed += 1
+                        save(checkpoint_path, checkpoint)
+                        if completed % 25 == 0 or completed == len(pending) or stopped:
+                            done = sum(v.get('status') == 'success' for v in entry['holdings'].values())
+                            print(f'{GROUPS[code]} holdings ({workers} workers): '
+                                  f'{contest["competition_name"]}; {done}/{len(entry["members"])}', flush=True)
+                    if stopped:
+                        break
+            finally:
+                stop_event.set()
+    finally:
+        for worker_client in clients:
+            client.events.extend(worker_client.events)
+            worker_client.events = []
+        save(checkpoint_path, checkpoint)
+    return stopped
+
+
+def collect_group(snapshot, code, client, interval, workers=1):
+    if type(workers) is not int or workers not in (1, 2):
+        raise SourceError('Holding workers must be 1 or 2')
     client.events = []
     checkpoint_path, checkpoint = load_checkpoint(snapshot, code)
     contests = [c for c in snapshot['contests'] if c['contest_key'] in snapshot['selected']]
@@ -245,6 +297,7 @@ def collect_group(snapshot, code, client, interval):
         validate_entry(checkpoint['contests'][c['contest_key']], c['participant_count'])
     save(checkpoint_path, checkpoint)
     stopped = False
+    worker_clients = [PublicClient(interval) for _ in range(workers)] if workers > 1 else []
     try:
         for contest in contests:
             entry = checkpoint['contests'][contest['contest_key']]
@@ -263,7 +316,7 @@ def collect_group(snapshot, code, client, interval):
         if not stopped:
             if all(checkpoint['contests'][c['contest_key']].get('ranking_complete') is True
                    and not checkpoint['contests'][c['contest_key']].get('failed_stage') for c in contests):
-                check_holdings_time_budget(snapshot, checkpoint, contests, code, interval)
+                check_holdings_time_budget(snapshot, checkpoint, contests, code, interval, workers)
             for contest in contests:
                 key = contest['contest_key']
                 entry = checkpoint['contests'][key]
@@ -271,6 +324,13 @@ def collect_group(snapshot, code, client, interval):
                     continue
                 raw = snapshot['path'] / 'competitions' / key / 'raw' / f'group-{code}'
                 pending = [uid for uid in entry['members'] if entry['holdings'].get(uid, {}).get('status') != 'success']
+                if workers > 1:
+                    stopped = collect_positions_parallel(contest, entry, mappings[key], raw, pending,
+                                                         code, interval, workers, checkpoint_path, checkpoint, client,
+                                                         worker_clients)
+                    if stopped:
+                        break
+                    continue
                 for n, uid in enumerate(pending, 1):
                     try:
                         entry['holdings'][uid] = collect_position(client, key, uid, mappings[key], raw)
@@ -288,12 +348,12 @@ def collect_group(snapshot, code, client, interval):
                 if stopped:
                     break
     finally:
-        checkpoint.setdefault('request_log', []).extend(client.events)
+        checkpoint.setdefault('request_log', []).extend(sorted(client.events, key=lambda event: event.get('requested_at', '')))
         save(checkpoint_path, checkpoint)
-    return build_group_payload(snapshot, checkpoint, code, interval, stopped)
+    return build_group_payload(snapshot, checkpoint, code, interval, stopped, workers)
 
 
-def build_group_payload(snapshot, checkpoint, code, interval, stopped):
+def build_group_payload(snapshot, checkpoint, code, interval, stopped, workers=1):
     completed_at = now()
     identity = validate_collection_identity(snapshot, {**checkpoint['metadata'],
                                                      'completed_at': completed_at}, require_completed=True)
@@ -329,6 +389,7 @@ def build_group_payload(snapshot, checkpoint, code, interval, stopped):
     return {'metadata': {**identity, 'group_code': code, 'group_name': GROUPS[code],
                          'completed_at': completed_at, 'collection_complete': complete,
                          'interval_seconds': interval, 'stopped_on_access_limit': stopped,
+                         'holding_workers': workers,
                          'contest_count': len(contests), 'record_count': len(records),
                          'member_count': member_count, 'holdings_success_count': success_count,
                          'holdings_failed_count': failed_count, 'scope': f'{GROUPS[code]}公开持仓，仅统计各赛原官方热榜股票'},
@@ -336,12 +397,15 @@ def build_group_payload(snapshot, checkpoint, code, interval, stopped):
 
 
 def run(args):
+    workers = getattr(args, 'workers', 1)
+    if type(workers) is not int or workers not in (1, 2):
+        raise SourceError('Holding workers must be 1 or 2')
     snapshot = read_snapshot(args.snapshot)
     weights = weights_config()
     groups = {'1000': read_existing_thousand(snapshot)}
     client = PublicClient(args.interval)
     for code in ('100',):
-        groups[code] = collect_group(snapshot, code, client, args.interval)
+        groups[code] = collect_group(snapshot, code, client, args.interval, workers)
         save(snapshot['path'] / f'group-{code}.json', groups[code])
         if groups[code]['metadata']['collection_complete'] is not True:
             raise SourceError(f'{GROUPS[code]} collection incomplete; weighted report will not publish')
@@ -354,6 +418,7 @@ def run(args):
                 'completed_at': completed_at,
                 'collection_complete': all(g['metadata']['collection_complete'] for g in ordered.values()),
                 'interval_seconds': args.interval,
+                'holding_workers': workers,
                 'member_count': sum(g['metadata']['member_count'] for g in ordered.values()),
                 'holdings_success_count': sum(g['metadata']['holdings_success_count'] for g in ordered.values()),
                 'holdings_failed_count': sum(g['metadata']['holdings_failed_count'] for g in ordered.values()),
@@ -413,6 +478,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot', type=Path, required=True)
     parser.add_argument('--interval', type=float, default=2.0)
+    parser.add_argument('--workers', type=int, choices=(1, 2), default=1,
+                        help='Explicit opt-in: parallel holdings readers, each paced by --interval')
     args = parser.parse_args()
     if not 2 <= args.interval < float('inf'):
         parser.error('interval must be finite and >=2 seconds')

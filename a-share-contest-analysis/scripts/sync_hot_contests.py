@@ -82,10 +82,12 @@ def last_json(result):
 
 def sync(args):
     hot_only = getattr(args, 'hot_only', False)
+    million_workers = getattr(args, 'million_workers', 1)
     stamp = datetime.now(TZ).strftime('%Y-%m-%d_%H%M%S_%f')
     status = {'started_at': now(), 'analyze_only': args.analyze_only,
               'collection_mode': 'official_hot_lists' if hot_only else 'capital_groups',
               'active_group_codes': [] if hot_only else ['100', '1000'],
+              'million_holding_workers': 0 if hot_only else million_workers,
               'stage': 'starting', 'complete': False, 'exit_code': None}
     history = args.report_root / 'sync-history' / (stamp + '.json')
     try:
@@ -132,7 +134,7 @@ def sync(args):
             status['stage'] = 'capital_group_collection'
             result = command('collect_capital_groups.py', [
                 '--snapshot', str(snapshot), '--interval', str(args.interval),
-            ])
+            ] + (['--workers', str(million_workers)] if million_workers > 1 else []))
             if result.returncode:
                 status.update(exit_code=result.returncode,
                               error='Capital-group collection did not complete; published report retained.')
@@ -216,6 +218,8 @@ def main():
     parser.add_argument('--registry', type=Path, default=ROOT / 'data' / 'contest-registry.json')
     parser.add_argument('--threshold', type=int, default=1000)
     parser.add_argument('--interval', type=float, default=2.0)
+    parser.add_argument('--million-workers', type=int, choices=(1, 2), default=1,
+                        help='Opt in to two million-group holdings readers; each uses --interval')
     try:
         args = parser.parse_args()
         if args.snapshot and not args.analyze_only:
