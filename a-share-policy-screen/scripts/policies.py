@@ -1,15 +1,33 @@
-"""Independent implementation of the seven user-supplied policies, not the Go service.
+"""Independent implementation of the six supported policies, not the Go service.
 
 Only raw data come from a-stock-data. Formula windows are reset for each policy.
 All dates are actual bar dates; invalid/missing input never becomes a zero-hit success.
 """
 import math
-from datetime import date, datetime, time, timezone
-from zoneinfo import ZoneInfo
+from datetime import date
 
-POLICIES = ["LOW_VOLUME_STABLE_PRICE", "B1", "B1_WEEKLY", "B1_V2", "B2_V1",
+POLICIES = ["LOW_VOLUME_STABLE_PRICE", "B1", "B1_WEEKLY", "B1_V2",
             "MA_GOLDEN_CROSS_FIRST_PULLBACK", "LOG_BIAS_STRENGTH_FILTER"]
-WINDOWS = dict(zip(POLICIES, [120, 21, 21, 114, 9, 741, 120]))
+# Current user-selected scope. Legacy formulas remain available only by explicit ID.
+DEFAULT_POLICIES = ["B1", "B1_WEEKLY", "MA_GOLDEN_CROSS_FIRST_PULLBACK"]
+WINDOWS = dict(zip(POLICIES, [120, 21, 21, 114, 741, 120]))
+POLICY_VERSIONS = {pid: pid.lower() + '_v1.0' for pid in POLICIES}
+POLICY_VERSIONS.update(B1='b1_volume_contraction_v2.1', B1_V2='b1_yellow_white_v2.0')
+B1_PARAMETERS = {'signal_max_age': 10, 'surge_min_multiple': 2.0,
+                 'contraction_min_days': 2, 'contraction_max_days': 3,
+                 'contraction_mean_max_fraction': .8, 'deep_contraction_fraction': .6,
+                 'support_tolerance': .03, 'timing': 'watch',
+                 'support': 'all_post_signal_closes_at_or_above_tolerated_signal_low',
+                 'score_version': 'b1_shape_score_v1.1'}
+
+
+def saved_policy_versions(report):
+    """Reports predating explicit versions retain their original formula identity."""
+    if 'policy_versions' in report:
+        return report['policy_versions']
+    legacy = {pid: pid.lower() + '_v1.0' for pid in POLICIES}
+    legacy['B1_V2'] = 'b1_yellow_white_v2.0'
+    return {p['id']: legacy[p['id']] for p in report['policies']}
 
 
 def validate(rows, n, target):
@@ -102,15 +120,93 @@ def surge(bars, i):
     return bars[i]["volume"] >= bars[i-1]["volume"] * 2 and bars[i]["close"] > bars[i-1]["close"]
 
 
-def run_policy(policy, rows, target, finance=None, boards=None, yellow_filter=False, require_pullback=False):
-    if policy == "B2_V1":
-        raise ValueError("B2 requires run_b2 with a saved source snapshot")
+def b1_volume_structure(bars):
+    """Mean contraction qualifies; deeper daily contraction and price retention earn points.
+
+    Scoring ranks chart resemblance only. It is neither a probability nor a hit gate.
+    KDJ initialization remains the caller's original 21/114-bar window.
+    """
+    p = B1_PARAMETERS
+    events = []
+    clip = lambda x: max(0.0, min(1.0, x))
+    for i in range(max(1, len(bars)-1-p['signal_max_age']), len(bars)-2):
+        signal = bars[i]
+        if signal['volume'] < bars[i-1]['volume']*p['surge_min_multiple'] or signal['close'] <= bars[i-1]['close']:
+            continue
+        following = bars[i+1:]
+        windows = []
+        for days in range(p['contraction_min_days'],p['contraction_max_days']+1):
+            if len(following)<days:
+                continue
+            window=following[:days]
+            fractions=[day['volume']/signal['volume'] for day in window]
+            fraction=math.fsum(fractions)/days
+            if math.fsum(day['volume'] for day in window)<=signal['volume']*days*p['contraction_mean_max_fraction']:
+                windows.append({'days':days,'window':window,'fractions':fractions,'mean':fraction})
+        confirmed = bool(windows)
+        min_close = min(day['close'] for day in following)
+        floor = signal['low']*(1-p['support_tolerance'])
+        held = min_close >= floor
+        prev5 = bars[max(0, i-5):i]
+        baseline = math.fsum(day['volume'] for day in prev5) / len(prev5)
+        event = {'date': signal['date'], 'age_bars': len(bars)-1-i,
+                 'volume_multiple': signal['volume']/bars[i-1]['volume'],
+                 'volume_vs_prev5': signal['volume']/baseline,
+                 'signal_close': signal['close'], 'signal_low': signal['low'],
+                 'contraction_days': max((w['days'] for w in windows),default=0),
+                 'contraction_dates': [], 'contraction_fractions': [],
+                 'first3_volume_fractions': [day['volume']/signal['volume'] for day in following[:3]],
+                 'support_floor': floor, 'support_held': held,
+                 'strict_support_held': min_close>=signal['low'], 'post_min_close': min_close,
+                 'pattern_match': confirmed and held,
+                 'reasons': ([] if confirmed else ['immediate_mean_contraction_not_completed']) +
+                            ([] if held else ['post_signal_close_broke_tolerated_support'])}
+        if event['pattern_match']:
+            close_band = (max(day['close'] for day in following)-min_close)/signal['close']
+            retained = (min_close-floor)/(signal['close']-floor)
+            scored=[]
+            for w in windows:
+                daily_quality=clip((1-max(w['fractions']))/(1-p['deep_contraction_fraction']))
+                parts = {'volume_strength': 10*clip((event['volume_multiple']-1)/2) +
+                                            10*clip((event['volume_vs_prev5']-1)/2),
+                         'contraction_depth': 30*clip((.8-w['mean'])/.6),
+                         'price_stability': 15*clip(retained) + 15*clip(1-close_band/.05),
+                         'contraction_continuity': 5*(w['days']-1)*daily_quality,
+                         'freshness': 10*clip((10-event['age_bars'])/7)}
+                scored.append({**w,'shape_score':round(math.fsum(parts.values()),2),
+                               'score_parts':{k:round(v,4) for k,v in parts.items()}})
+            chosen=max(scored,key=lambda w:(w['shape_score'],w['days']))
+            event.update(contraction_days=chosen['days'],
+                         contraction_dates=[day['date'] for day in chosen['window']],
+                         contraction_fractions=chosen['fractions'],
+                         mean_contraction_fraction=chosen['mean'],
+                         deep_contraction=all(f<=p['deep_contraction_fraction'] for f in chosen['fractions']),
+                         post_close_band_pct=close_band*100,score_parts=chosen['score_parts'],
+                         shape_score=chosen['shape_score'],
+                         evaluated_windows=[{'days':w['days'],'mean_fraction':w['mean'],
+                                             'shape_score':w['shape_score']} for w in scored])
+        events.append(event)
+    matches = [e for e in events if e['pattern_match']]
+    selected = max(matches, key=lambda e: (e['shape_score'], e['date'])) if matches else None
+    return {'version': POLICY_VERSIONS['B1'], 'shape_score': selected['shape_score'] if selected else None,
+            'signal_date': selected['date'] if selected else None, 'selected_signal': selected,
+            'recent_surges': events, 'recent_surge_count': len(events)}
+
+
+def run_policy(policy, rows, target, finance=None, boards=None, yellow_filter=False, require_pullback=False, _validated=False, _weeks=None):
     need = 114 if yellow_filter and policy in ("B1", "B1_WEEKLY") else WINDOWS[policy]
     try:
-        if policy == 'B1_WEEKLY':
+        if policy == 'B1_WEEKLY' and not _validated:
             validate(rows, len(rows) or 1, target)
-        data = aggregate_iso_weeks(rows) if policy == "B1_WEEKLY" else rows
-        bars = validate(data, need, target)
+        data = (_weeks if _weeks is not None else aggregate_iso_weeks(rows)) if policy == 'B1_WEEKLY' else rows
+        if _validated and policy != 'B1_WEEKLY':
+            if len(data) < need:
+                raise ValueError(f'insufficient_bars:{len(data)}<{need}')
+            if data[-1]['date'] != target:
+                raise ValueError('stale_last_bar:' + data[-1]['date'])
+            bars = data[-need:]
+        else:
+            bars = validate(data, need, target)
     except (ValueError, KeyError, TypeError) as e:
         return {"status": "not_evaluated", "reasons": [str(e)]}
     close, volume = bars[-1]["close"], bars[-1]["volume"]
@@ -129,11 +225,20 @@ def run_policy(policy, rows, target, finance=None, boards=None, yellow_filter=Fa
             common.update(vmin=vmin, low_volume_days=count, max_deviation_pct=deviation * 100)
         else:
             indicator = kdj(bars)
-            events = [{"date": bars[i]["date"], "volume_multiple": bars[i]["volume"] / bars[i-1]["volume"]}
-                      for i in range(len(bars)-20, len(bars)) if surge(bars, i)]
             bad = [bars[i]["date"] for i in range(len(bars)-5, len(bars)) if bars[i]["close"] <= bars[i-1]["close"] * .905]
-            checks.update(j_below_15=indicator["J"] < 15, two_surges=len(events) >= 2, no_drop_9_5=not bad)
-            common.update(**indicator, surge_count=len(events), surges=events, large_drop_dates=bad)
+            checks.update(j_below_15=indicator["J"] < 15, no_drop_9_5=not bad)
+            common.update(**indicator, large_drop_dates=bad)
+            if policy == 'B1':
+                structure = b1_volume_structure(bars)
+                checks.update(recent_volume_surge=bool(structure['recent_surges']),
+                              immediate_contraction_2_3_days=any(e['contraction_days']>=2 for e in structure['recent_surges']),
+                              contraction_structure_held=structure['selected_signal'] is not None)
+                common.update(**structure)
+            else:
+                events = [{"date": bars[i]["date"], "volume_multiple": bars[i]["volume"] / bars[i-1]["volume"]}
+                          for i in range(len(bars)-20, len(bars)) if surge(bars, i)]
+                checks.update(two_surges=len(events) >= 2)
+                common.update(surge_count=len(events), surges=events)
             if policy == "B1_WEEKLY":
                 common.update(latest_week=bars[-1]["iso_week"], latest_week_trading_days=bars[-1]["trading_days"],
                               provisional_week=date.fromisoformat(target).weekday() < 4)
@@ -201,48 +306,3 @@ def run_policy(policy, rows, target, finance=None, boards=None, yellow_filter=Fa
         common.update(bias=bias[-1], strong_zone=bias[-1] >= 5, pullback=pullback)
         return finish(checks, common)
     raise ValueError("unknown_policy:" + policy)
-
-
-def b2_component(rows, target, signal_date):
-    bars = validate(rows, 9, target)
-    if [b["date"] for b in bars[-2:]] != [signal_date, target]:
-        raise ValueError("B2 requires adjacent actual signal and target bars")
-    b, s = bars[-1], bars[-2]
-    indicator = kdj(bars)
-    ret = (b["close"] / s["close"] - 1) * 100
-    checks = {"positive_candle": b["close"] > b["open"], "gain_over_4pct": b["close"] > s["close"] * 1.04,
-              "higher_volume": b["volume"] > s["volume"], "j_below_55": indicator["J"] < 55}
-    return finish(checks, {**indicator, "signal_date": signal_date, "last_bar_date": target,
-                           "return_pct": ret, "volume_multiple": b["volume"] / s["volume"],
-                           "no_upper_shadow": b["high"] == b["close"]})
-
-
-def run_b2(snapshot, rows_by_symbol, target, previous_market_day, strict_next_day=False):
-    if (not isinstance(snapshot,dict) or snapshot.get("status") != "success" or snapshot.get("policy_id") != "B1_V2"
-            or snapshot.get("version") != "b1_yellow_white_v2.0" or snapshot.get("trade_date") != previous_market_day
-            or not isinstance(snapshot.get("candidates"), list) or not snapshot.get("saved_at")):
-        return {"status": "source_unavailable", "reason": "B2 来源不可用：缺少已成功保存的前一交易日指定版本 B1_V2 快照", "hit_count": None}
-    try:
-        saved = datetime.fromisoformat(snapshot['saved_at'].replace('Z','+00:00'))
-        start = datetime.combine(date.fromisoformat(previous_market_day),time(15),ZoneInfo('Asia/Shanghai'))
-        cutoff = datetime.combine(date.fromisoformat(target),time(15),ZoneInfo('Asia/Shanghai'))
-        if saved.tzinfo is None or not start <= saved <= cutoff or saved > datetime.now(timezone.utc):
-            raise ValueError('invalid_saved_at')
-    except (ValueError,TypeError,AttributeError):
-        return {'status':'source_unavailable','reason':'B2 来源不可用：保存时间无效，或来源在目标日收盘后才保存','hit_count':None}
-    results = []
-    seen = set()
-    for item in snapshot['candidates']:
-        if not isinstance(item, dict) or not isinstance(item.get('symbol'), str) or item['symbol'] in seen:
-            return {'status': 'source_unavailable', 'reason': 'B2 来源不可用：候选记录格式错误或重复', 'hit_count': None}
-        seen.add(item['symbol'])
-    for item in snapshot["candidates"]:
-        symbol = item["symbol"]
-        try:
-            if strict_next_day and (item.get('signal_date') or previous_market_day) != previous_market_day:
-                raise ValueError('signal_date_not_previous_market_day')
-            value = b2_component(rows_by_symbol.get(symbol, []), target, item.get("signal_date") or previous_market_day)
-        except (ValueError, KeyError) as e:
-            value = {"status": "not_evaluated", "reasons": [str(e)]}
-        results.append({"symbol": symbol, **value})
-    return {"status": "completed", "results": results, "hit_count": sum(r["status"] == "hit" for r in results)}

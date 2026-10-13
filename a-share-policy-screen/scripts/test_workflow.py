@@ -1,5 +1,6 @@
-"""Synthetic checks of data gates, provenance, B2 and portable report output."""
+"""Synthetic checks of data gates, provenance and portable report output."""
 import copy
+import gzip
 import json
 import subprocess
 import sys
@@ -11,6 +12,8 @@ from screen import evaluate
 from reporting import view_model, write_reports
 from fetch_data import reusable_bundle
 from test_policies import bars
+from test_b1_structure import shape_rows
+from policies import DEFAULT_POLICIES, POLICIES
 
 
 def fixture(n=120):
@@ -27,13 +30,21 @@ def fixture(n=120):
 
 class WorkflowTests(unittest.TestCase):
     def test_all_policies_keep_missing_vs_zero(self):
-        result=evaluate(fixture())
+        result=evaluate(fixture(), POLICIES)
         p={p['id']:p for p in result['policies']}
         self.assertEqual(p['B1']['status'],'completed')
         self.assertEqual(p['B1']['hit_count'],0)
         self.assertEqual(p['MA_GOLDEN_CROSS_FIRST_PULLBACK']['missing'],1)
-        self.assertEqual(p['B2_V1']['status'],'source_unavailable')
-        self.assertIsNone(p['B2_V1']['hit_count'])
+        self.assertEqual(len(p),6)
+        self.assertNotIn('B2_V1',p)
+
+    def test_default_selects_only_current_three_with_same_decisions(self):
+        bundle=fixture()
+        current=evaluate(bundle)
+        explicit=evaluate(bundle,DEFAULT_POLICIES)
+        self.assertEqual([p['id'] for p in current['policies']],
+                         ['B1','B1_WEEKLY','MA_GOLDEN_CROSS_FIRST_PULLBACK'])
+        self.assertEqual(current['policies'],explicit['policies'])
 
     def test_future_rows_excluded_before_indicators(self):
         bundle=fixture();target=bundle['target_date'];s=bundle['stocks'][0]
@@ -77,9 +88,7 @@ class WorkflowTests(unittest.TestCase):
     def test_report_portable_dates_short_history_and_safe_names(self):
         b=fixture(21)
         b['stocks'][0]['finance']['total_shares']=1000000000
-        for i in [4,10]:b['stocks'][0]['bars'][i].update(close=10.1,high=10.1,volume=200)
-        b['stocks'][0]['bars'][-2].update(close=9.9,low=9.9)
-        b['stocks'][0]['bars'][-1].update(close=9.8,low=9.8)
+        b['stocks'][0]['bars']=shape_rows()
         r=evaluate(b,['B1']);m=view_model(r)
         self.assertEqual(len(m['stocks']['sh600001']['daily']['chart']),21)
         self.assertIsNone(m['stocks']['sh600001']['daily']['chart'][0]['ma5'])
@@ -92,19 +101,40 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(b['target_date'],content)
             self.assertNotIn('__DATA_JSON__',content)
 
-    def test_valid_empty_b2_snapshot_is_completed_zero(self):
-        b=fixture();p=b['market_days'][-2]
-        snap={'policy_id':'B1_V2','version':'b1_yellow_white_v2.0','trade_date':p,'saved_at':p+'T16:00:00+08:00',
-              'status':'success','candidates':[]}
-        result=evaluate(b,['B2_V1'],snapshot=snap)['policies'][0]
-        self.assertEqual((result['status'],result['pool'],result['hit_count']),('completed',0,0))
+    def test_b1_rank_order_and_report_score_match_saved_evidence(self):
+        b=fixture(21);s=b['stocks'][0];s['bars']=shape_rows()
+        s['finance']['total_shares']=1_000_000_000
+        other=copy.deepcopy(s);other['symbol']='sh600002'
+        other['bars']=shape_rows(fractions=(.25,.2,.15));b['stocks'].append(other)
+        report=evaluate(b,['B1']);model=view_model(report);p=report['policies'][0]
+        self.assertEqual(p['hits'],['sh600002','sh600001'])
+        self.assertTrue(model['policies'][0]['ranked'])
+        for row in p['results']:
+            self.assertEqual(row['metrics']['shape_score'],model['policies'][0]['shapes'][row['symbol']]['score'])
+        with tempfile.TemporaryDirectory() as d:
+            write_reports(report,d)
+            text=Path(d,'report.md').read_text()
+            self.assertIn('形态分 | 异动日',text)
+            self.assertLess(text.index('600002.SH'),text.index('600001.SH'))
 
-    def test_partial_snapshot_stock_remains_in_denominator(self):
-        b=fixture();p=b['market_days'][-2]
-        snap={'policy_id':'B1_V2','version':'b1_yellow_white_v2.0','trade_date':p,'saved_at':p+'T16:00:00+08:00',
-              'status':'success','candidates':[{'symbol':'sh600002','signal_date':p}]}
-        r=evaluate(b,['B2_V1'],snapshot=snap)['policies'][0]
-        self.assertEqual((r['pool'],r['missing'],r['status']),(1,1,'not_evaluated'))
+    def test_old_b1_report_and_other_policies_do_not_inherit_shape_scores(self):
+        b=fixture(160);b['stocks'][0]['bars']=shape_rows(n=160)
+        b['stocks'][0]['finance']['total_shares']=1_000_000_000
+        report=evaluate(b,['B1','B1_WEEKLY'])
+        model=view_model(report)
+        self.assertFalse(model['policies'][1]['ranked'])
+        self.assertEqual(model['policies'][1]['shapes'],{})
+        saved_score=model['policies'][0]['shapes']['sh600001']['score']
+        report['policies'][0]['version']='b1_volume_contraction_v2.0'
+        old_scored=view_model(report)
+        self.assertTrue(old_scored['policies'][0]['ranked'])
+        self.assertEqual(old_scored['policies'][0]['shapes']['sh600001']['score'],saved_score)
+        report['policies'][0].pop('version')
+        legacy=view_model(report)
+        self.assertFalse(legacy['policies'][0]['ranked'])
+        self.assertEqual(legacy['policies'][0]['shapes'],{})
+
+
 
     def test_bad_member_does_not_abort_valid_member(self):
         for bad_field in ('date', 'nan_close'):
@@ -120,40 +150,18 @@ class WorkflowTests(unittest.TestCase):
                     write_reports(result,d)
                     json.dumps(result,allow_nan=False)
 
-    def test_invalid_snapshot_time_is_unavailable(self):
-        b=fixture();p=b['market_days'][-2]
-        for stamp in ('NOT_A_DATE','2099-01-01T16:00:00+08:00',p+'T14:59:59+08:00',p+'T16:00:00',b['target_date']+'T15:00:01+08:00'):
-            with self.subTest(stamp=stamp):
-                snap={'policy_id':'B1_V2','version':'b1_yellow_white_v2.0','trade_date':p,
-                      'saved_at':stamp,'status':'success','candidates':[]}
-                result=evaluate(b,['B2_V1'],snapshot=snap)['policies'][0]
-                self.assertEqual(result['status'],'source_unavailable')
-                self.assertIsNone(result['hit_count'])
 
-    def test_missing_or_corrupt_snapshot_keeps_other_policies(self):
-        for corrupt in (False,True):
-            with self.subTest(corrupt=corrupt),tempfile.TemporaryDirectory() as d:
-                root=Path(d);source=root/'input.json';source.write_text(json.dumps(fixture()))
-                snap=root/'snapshot.json'
-                if corrupt:snap.write_text('{bad json')
-                process=subprocess.run([sys.executable,str(Path(__file__).with_name('screen.py')),
-                    '--input',str(source),'--out',str(root/'run'),'--b2-snapshot',str(snap)],capture_output=True,text=True)
-                self.assertEqual(process.returncode,0,process.stderr)
-                result=json.loads((root/'run/results.json').read_text());p={p['id']:p for p in result['policies']}
-                self.assertEqual(len(p),7)
-                self.assertEqual(p['B2_V1']['status'],'source_unavailable')
-                self.assertEqual(p['LOW_VOLUME_STABLE_PRICE']['hit_count'],1)
-                self.assertTrue((root/'run/report.html').is_file())
 
     def test_large_report_preserves_complete_file(self):
         b=fixture();b['universe_source']='x'*1_000_000
         result=evaluate(b,['LOW_VOLUME_STABLE_PRICE'])
         with tempfile.TemporaryDirectory() as d:
             write_reports(result,d);root=Path(d)
-            self.assertFalse((root/'report.inline.html').exists())
             self.assertTrue((root/'report.html').exists())
+            restored=json.loads(gzip.decompress((root/'view-model.json.gz').read_bytes()))
+            self.assertIn('x'*1_000_000,restored['notes'][0])
             manifest=json.loads((root/'render-manifest.json').read_text())
-            self.assertFalse(manifest['inline_available'])
+            self.assertEqual(manifest['inline_available'],(root/'report.inline.html').exists())
             self.assertEqual(manifest['candidate_count'],1)
 
     def test_reuse_input_is_same_day_qfq_and_network_free(self):

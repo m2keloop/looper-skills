@@ -18,6 +18,7 @@
   ],
   "local_modifications": [
     "Only read-only market, finance, board, and calendar helpers retained; unrelated APIs and examples removed.",
-    "Collector combines qfq historical/recent data with overlap checks, verifies volume units, bounds fallback subprocesses, and records source failures."
+    "Collector combines qfq historical/recent data with overlap checks, verifies volume units, bounds fallback subprocesses, and records source failures.",
+    "Non-Eastmoney HTTP helpers share one requests.Session and request-start limiter; request counts and waiting are recorded without raw headers or query parameters."
   ]
 }

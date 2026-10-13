@@ -6,20 +6,30 @@
 
 | Skill | 简介 |
 | --- | --- |
-| [a-share-policy-screen](./a-share-policy-screen/SKILL.md) | lan选股策略：执行七种 A 股收盘选股规则，并生成策略切换、紧凑股票列表和联动量价图报告。 |
+| [a-share-policy-screen](./a-share-policy-screen/SKILL.md) | lan选股策略：默认运行 B1、B1 周线、年线金叉回踩；B1 按异动后缩量形态评分，复用增量缓存生成紧凑量价报告。 |
 | [a-share-contest-analysis](./a-share-contest-analysis/SKILL.md) | 采集公开炒股比赛热股榜，生成比赛名单、持仓人数排行、每日变化和近期 K 线分析；支持交易日收盘同步。 |
 | [ncm-convert](./ncm-convert/SKILL.md) | 使用 ncmdump 将网易云音乐 `.ncm` 文件转换为 MP3 或 FLAC，支持单文件和文件夹批量转换。 |
 | [photo-style-batch](./photo-style-batch/SKILL.md) | 根据提示词批量转换照片，支持递增归档、双画面裁切、匿名输出和元数据清除。 |
 
 ### a-share-policy-screen
 
-执行地量、B1、B1 周线、B1_V2、B2_V1、年线金叉回踩和对数乖离率七种 A 股收盘选股策略。默认在同一目标日和候选范围内复用前复权 K 线输入，减少重复行情请求；结果以策略切换、紧凑股票列表和量价图展示。
+默认执行 **B1、B1 周线、年线金叉回踩**三种 A 股收盘选股策略；B2 已移除。地量、B1_V2、对数乖离率保留历史公式供明确点名时手动运行，不参与默认日终任务。
+
+日线 B1 v2.1 要求近10根有效日K内出现倍量收涨，随后紧接两根或三根的平均量不超过异动日80%，之后收盘保留异动低点下方3%的容差。保留 J、市值与默认主板过滤；完成后继续观察。逐日深缩量、价格稳定和新鲜程度用于0—100形态分，结果默认按分数排序；分数仅表示形态贴合程度，不代表上涨概率。周 B1 保留原公式。
+
+统一入口 `scripts/run_daily.py` 使用版本化 SQLite 行情缓存，只补缺失日K，复权变化或真正缺少历史时才刷新；同一快照供策略、周线、均线与报告使用。结果按策略 Tab 展示紧凑全量名单和联动量价图。历史结果按原公式与分数保存，公式更新另存版本目录。
 
 使用示例：
 
-> 用 $a-share-policy-screen 跑最近收盘日的全部策略，展示选股结果。
+> 用 $a-share-policy-screen 跑最近收盘日的默认三策略，展示选股结果。
 
-行情适配自 [simonlin1212/a-stock-data](https://github.com/simonlin1212/a-stock-data)，所含适配代码的许可证见 [a-stock-data-LICENSE.txt](./a-share-policy-screen/references/a-stock-data-LICENSE.txt)。
+```bash
+python3 a-share-policy-screen/scripts/run_daily.py --root OUTPUT/daily-selection --date latest
+# 已有目标日快照时，可完全离线复算
+python3 a-share-policy-screen/scripts/run_daily.py --root OUTPUT/daily-selection --date YYYY-MM-DD --offline
+```
+
+行情适配自 [simonlin1212/a-stock-data](https://github.com/simonlin1212/a-stock-data)，所含适配代码许可证见 [a-stock-data-LICENSE.txt](./a-share-policy-screen/references/a-stock-data-LICENSE.txt)。策略命中仅表示规则成立，不生成交易指令。
 
 ### a-share-contest-analysis
 
@@ -60,3 +70,4 @@
 ## 使用方式
 
 每个 Skill 独立放在同名文件夹中，包含 `SKILL.md` 及所需资源。将整个 Skill 文件夹复制到所用 Agent 的技能目录；Codex 可放在 `~/.codex/skills/` 下，然后在对话中调用对应 Skill。
+

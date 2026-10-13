@@ -2,7 +2,7 @@
 import unittest
 from datetime import date, timedelta
 
-from policies import aggregate_iso_weeks, b2_component, kdj, run_b2, run_policy, validate
+from policies import aggregate_iso_weeks, kdj, run_policy, validate
 
 
 def bars(n, price=10):
@@ -61,17 +61,7 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(r["metrics"]["strong_zone"])
         self.assertEqual(run_policy("LOG_BIAS_STRENGTH_FILTER", b, b[-1]["date"], require_pullback=True)["status"], "not_hit")
 
-    def test_b2_missing_or_wrong_version(self):
-        for snapshot in [None, {"status": "success", "policy_id": "B1_V2", "version": "wrong",
-                               "trade_date": "2026-09-28", "saved_at": "2026-09-28", "candidates": []}]:
-            r = run_b2(snapshot, {}, "2026-09-29", "2026-09-28")
-            self.assertEqual(r["status"], "source_unavailable")
-            self.assertIsNone(r["hit_count"])
 
-    def test_b2_requires_actual_adjacent_signal_bar(self):
-        b = bars(9)
-        with self.assertRaisesRegex(ValueError, "adjacent"):
-            b2_component(b, b[-1]["date"], b[-3]["date"])
 
     def test_b1_large_drop_inclusive_threshold(self):
         b = bars(21, 1000)
@@ -108,11 +98,6 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(r["status"], "hit")
         self.assertEqual(r["metrics"]["support"][0]["ma"], 250)
 
-    def test_b2_exact_4pct_is_not_greater(self):
-        b = bars(9)
-        b[-1].update(close=10.4, high=10.5, volume=200)
-        r = b2_component(b, b[-1]["date"], b[-2]["date"])
-        self.assertFalse(r["checks"]["gain_over_4pct"])
 
     def test_b1_v2_exact_minus_2pct_included(self):
         b = bars(114, 100)

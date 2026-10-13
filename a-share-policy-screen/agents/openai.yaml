@@ -1,4 +1,4 @@
 interface:
   display_name: "lan选股策略"
-  short_description: "七策略收盘选股，复用一次行情快照生成紧凑量价报告"
-  default_prompt: "使用 $a-share-policy-screen 按最近已收盘交易日运行全部七种策略，复用同一份行情快照并用策略 Tab 展示结果。"
+  short_description: "三策略收盘选股，B1异动后缩量形态评分，复用缓存生成紧凑量价报告"
+  default_prompt: "使用 $a-share-policy-screen 运行最近收盘日的 B1、B1 周线、年线金叉回踩，复用行情快照；日线B1按异动后缩量形态分排序，以策略 Tab 展示完整结果。"

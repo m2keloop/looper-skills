@@ -105,6 +105,8 @@ import re
 from datetime import date as _date_cls, datetime, timezone
 import pandas as pd
 import requests
+from request_control import HTTPClient
+V39_CLIENT = HTTPClient()
 V39_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 
 def _v39_http(url, params=None, data=None, headers=None, method='GET', timeout=(10, 40), allow_status=(), allow_redirects=True):
@@ -113,7 +115,7 @@ def _v39_http(url, params=None, data=None, headers=None, method='GET', timeout=(
     merged = {'User-Agent': V39_UA}
     merged.update(headers or {})
     try:
-        response = requests.request(method, url, params=params, data=data, headers=merged, timeout=timeout, allow_redirects=allow_redirects)
+        response = V39_CLIENT.request(method, url, params=params, data=data, headers=merged, timeout=timeout, allow_redirects=allow_redirects)
         if response.status_code not in allow_status:
             response.raise_for_status()
     except requests.RequestException as exc:
